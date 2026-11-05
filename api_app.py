@@ -2,6 +2,7 @@
 from __future__ import annotations
 from functools import lru_cache
 from pathlib import Path
+from datetime import date, timedelta
 import re
 import time
 import cvxpy as cp
@@ -28,6 +29,9 @@ app.mount("/static", StaticFiles(directory=STATIC), name="static")
 class PortfolioRequest(BaseModel):
     tickers: list[str] = Field(min_length=1, max_length=12)
     period: str = "2y"
+    start_date: date | None = None
+    end_date: date | None = None
+    purchases: dict[str, dict] | None = None
     method: str = "manual"
     weights: list[float] | None = None  # fractions, not percentages
     var_limit: float = Field(default=.03, gt=0, lt=1)
@@ -45,8 +49,23 @@ class PortfolioRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_portfolio(self) -> PortfolioRequest:
-        if self.period not in {"6mo", "1y", "2y", "5y"} or self.method not in METHODS:
+        if self.period not in {"6mo", "1y", "2y", "5y", "10y", "max", "custom"} or self.method not in METHODS:
             raise ValueError("Período ou método de alocação inválido")
+        if self.period == "custom":
+            if not self.start_date or not self.end_date or self.start_date >= self.end_date or self.end_date > date.today():
+                raise ValueError("Informe datas inicial e final válidas, até hoje.")
+        if self.purchases:
+            if set(self.purchases) - set(self.tickers):
+                raise ValueError("Compra informada para ativo fora da carteira.")
+            for symbol, purchase in self.purchases.items():
+                try:
+                    bought = date.fromisoformat(str(purchase["date"]))
+                    price = float(purchase["price"])
+                    quantity = float(purchase["quantity"])
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise ValueError(f"Compra inválida para {symbol}.") from exc
+                if bought > date.today() or not np.isfinite([price, quantity]).all() or price <= 0 or quantity <= 0:
+                    raise ValueError(f"Data, preço e quantidade de {symbol} devem ser válidos e positivos.")
         if self.method == "manual":
             if self.weights is None or len(self.weights) != len(self.tickers):
                 raise ValueError("Informe um peso para cada ativo")
@@ -57,10 +76,12 @@ class PortfolioRequest(BaseModel):
 
 
 @lru_cache(maxsize=128)
-def _download_cached(tickers: tuple[str, ...], period: str, bucket: int) -> pd.DataFrame:
+def _download_cached(tickers: tuple[str, ...], period: str, bucket: int,
+                     start: str | None = None, end: str | None = None) -> pd.DataFrame:
     """Cache market-only prices for 15 minutes; never cache portfolios or limits."""
     try:
-        raw = yf.download(list(tickers), period=period, interval="1d", auto_adjust=True,
+        params = {"start": start, "end": end} if start and end else {"period": period}
+        raw = yf.download(list(tickers), **params, interval="1d", auto_adjust=True,
                           progress=False, threads=False, timeout=15)
     except Exception as exc:
         raise HTTPException(502, "Provedor de preços indisponível. Tente novamente em instantes.") from exc
@@ -77,7 +98,7 @@ def _download_cached(tickers: tuple[str, ...], period: str, bucket: int) -> pd.D
     close = close.loc[:, list(tickers)].sort_index().ffill().dropna(how="any")
     if any(symbol.endswith(".SA") for symbol in tickers) and any(not symbol.endswith(".SA") for symbol in tickers):
         try:
-            fx_raw = yf.download("USDBRL=X", period=period, interval="1d", auto_adjust=True,
+            fx_raw = yf.download("USDBRL=X", **params, interval="1d", auto_adjust=True,
                                  progress=False, threads=False, timeout=15)
             fx = fx_raw["Close"]
             if isinstance(fx, pd.DataFrame):
@@ -94,11 +115,33 @@ def _download_cached(tickers: tuple[str, ...], period: str, bucket: int) -> pd.D
 
 
 def _returns(request: PortfolioRequest) -> pd.DataFrame:
-    prices = _download_cached(tuple(sorted(request.tickers)), request.period, int(time.time() // 900))
+    end = (request.end_date + timedelta(days=1)).isoformat() if request.end_date else None
+    prices = _download_cached(tuple(sorted(request.tickers)), request.period, int(time.time() // 900),
+                              request.start_date.isoformat() if request.start_date else None, end)
     returns = prices.loc[:, request.tickers].pct_change(fill_method=None).iloc[1:]
     if not np.isfinite(returns.to_numpy()).all():
         raise HTTPException(422, "Retornos inválidos; tente outra janela histórica.")
     return returns
+
+
+@lru_cache(maxsize=128)
+def _latest_close_cached(tickers: tuple[str, ...], bucket: int) -> dict[str, float]:
+    """Current unadjusted closes, in each asset's quote currency, for cost-basis comparison."""
+    raw = yf.download(list(tickers), period="5d", interval="1d", auto_adjust=False,
+                      progress=False, threads=False, timeout=15)
+    if raw.empty:
+        raise HTTPException(502, "Não foi possível obter preços atuais para avaliar as compras.")
+    close = raw["Close"]
+    if isinstance(close, pd.Series):
+        close = close.to_frame(name=tickers[0])
+    if len(tickers) == 1:
+        close.columns = [tickers[0]]
+    result = {}
+    for symbol in tickers:
+        if symbol not in close or close[symbol].dropna().empty:
+            raise HTTPException(422, f"Sem preço atual para {symbol}.")
+        result[symbol] = float(close[symbol].dropna().iloc[-1])
+    return result
 
 
 def _max_sharpe(returns: pd.DataFrame) -> pd.Series:
@@ -165,6 +208,19 @@ def portfolio_risk(request: PortfolioRequest) -> dict:
                          if portfolio_vol > 0 else np.zeros_like(w))
     correlation = returns.corr().fillna(0).to_numpy()
     np.fill_diagonal(correlation, 1.)
+    purchase_analysis = []
+    if request.purchases:
+        current = _latest_close_cached(tuple(sorted(request.purchases)), int(time.time() // 900))
+        for symbol, purchase in request.purchases.items():
+            price, quantity = float(purchase["price"]), float(purchase["quantity"])
+            latest = current[symbol]
+            purchase_analysis.append({
+                "ticker": symbol, "date": str(purchase["date"]),
+                "currency": "BRL" if symbol.endswith(".SA") else "USD",
+                "quantity": quantity, "purchase_price": price, "current_price": latest,
+                "cost": price * quantity, "market_value": latest * quantity,
+                "pnl": (latest - price) * quantity, "return": latest / price - 1,
+            })
     metrics.update({
         "return_annual": float(np.prod(1 + portfolio) ** (252 / len(portfolio)) - 1),
         "downside_volatility_annual": float(np.sqrt(np.mean(np.minimum(portfolio, 0) ** 2) * 252)),
@@ -181,6 +237,7 @@ def portfolio_risk(request: PortfolioRequest) -> dict:
             "rolling_volatility_21d": [None if pd.isna(v) else float(v) for v in rolling_vol],
             "correlation": correlation.tolist(),
             "risk_contribution": dict(zip(request.tickers, risk_contribution.tolist())),
+            "purchase_analysis": purchase_analysis,
             "observations": len(returns)}
 
 
