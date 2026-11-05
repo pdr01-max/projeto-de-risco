@@ -135,3 +135,24 @@ def test_garch_forecast_and_out_of_sample():
     assert np.isfinite([var, es, result["p_value"]]).all()
     assert es >= var
     assert result["observations"] == 50
+
+
+def test_benchmark_changes_with_base_currency(monkeypatch):
+    dates = pd.date_range("2026-01-05", periods=3, freq="B")
+    series = {"^BVSP": [100., 110., 120.], "^GSPC": [100., 110., 120.]}
+    monkeypatch.setattr(api_app, "_download_cached", lambda tickers, *args:
+                        pd.DataFrame({tickers[0]: series[tickers[0]]}, index=dates))
+    monkeypatch.setattr(api_app, "_fx_cached", lambda *args:
+                        pd.Series([5., 5.5, 6.], index=dates))
+    for symbol in ("^BVSP", "^GSPC"):
+        brl = api_app._benchmark_series(api_app.PortfolioRequest(
+            tickers=["AAPL"], weights=[1.], benchmark=symbol, base_currency="BRL"), dates, 0)
+        usd = api_app._benchmark_series(api_app.PortfolioRequest(
+            tickers=["AAPL"], weights=[1.], benchmark=symbol, base_currency="USD"), dates, 0)
+        assert brl["wealth_index"][-1] != usd["wealth_index"][-1]
+        assert np.isclose(brl["wealth_index"][-1] / usd["wealth_index"][-1], 6 / 5)
+
+
+def test_2008_replaces_2022_stress_window():
+    assert any("2008" in label for label in api_app.STRESS_WINDOWS)
+    assert all("2022" not in label for label in api_app.STRESS_WINDOWS)
