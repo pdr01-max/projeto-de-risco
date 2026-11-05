@@ -3,6 +3,9 @@ from __future__ import annotations
 from functools import lru_cache
 from pathlib import Path
 from datetime import date, timedelta
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
+import json
 import re
 import time
 import cvxpy as cp
@@ -121,7 +124,73 @@ def _returns(request: PortfolioRequest) -> pd.DataFrame:
     returns = prices.loc[:, request.tickers].pct_change(fill_method=None).iloc[1:]
     if not np.isfinite(returns.to_numpy()).all():
         raise HTTPException(422, "Retornos inválidos; tente outra janela histórica.")
+    returns.attrs["first_price_date"] = prices.index[0]
     return returns
+
+
+@lru_cache(maxsize=64)
+def _cdi_cached(start: date, end: date, bucket: int) -> pd.Series:
+    """BCB SGS 12: daily CDI in percent; historical requests are split below 10 years."""
+    chunks: list[pd.Series] = []
+    left = start
+    try:
+        while left <= end:
+            right = min(left + timedelta(days=365 * 8), end)
+            query = urlencode({"formato": "json", "dataInicial": left.strftime("%d/%m/%Y"),
+                               "dataFinal": right.strftime("%d/%m/%Y")})
+            url = f"https://api.bcb.gov.br/dados/serie/bcdata.sgs.12/dados?{query}"
+            with urlopen(Request(url, headers={"User-Agent": "quant-risk-engine/2.0"}), timeout=20) as response:
+                observations = json.load(response)
+            if observations:
+                frame = pd.DataFrame(observations)
+                values = pd.Series(pd.to_numeric(frame["valor"].str.replace(",", "."), errors="raise").to_numpy() / 100,
+                                   index=pd.to_datetime(frame["data"], format="%d/%m/%Y"))
+                chunks.append(values)
+            left = right + timedelta(days=1)
+    except Exception as exc:
+        raise HTTPException(502, "CDI histórico indisponível no Banco Central. Tente novamente em instantes.") from exc
+    if not chunks:
+        raise HTTPException(502, "Sem observações de CDI para a janela selecionada.")
+    cdi = pd.concat(chunks).sort_index()
+    if not np.isfinite(cdi.to_numpy()).all() or (cdi < 0).any():
+        raise HTTPException(502, "Série histórica de CDI inválida.")
+    return cdi
+
+
+@lru_cache(maxsize=64)
+def _fx_cached(start: date, end: date, bucket: int) -> pd.Series:
+    """USD/BRL adjusted close for valuing CDI cash in a USD portfolio."""
+    try:
+        raw = yf.download("USDBRL=X", start=start.isoformat(), end=(end + timedelta(days=1)).isoformat(),
+                          interval="1d", auto_adjust=True, progress=False, threads=False, timeout=15)
+        close = raw["Close"]
+        if isinstance(close, pd.DataFrame):
+            close = close.iloc[:, 0]
+        close = close.dropna().sort_index()
+        if close.empty or (close <= 0).any():
+            raise ValueError("missing FX")
+        return close
+    except Exception as exc:
+        raise HTTPException(502, "USD/BRL indisponível para converter o caixa CDI em dólares.") from exc
+
+
+def _cash_returns(returns: pd.DataFrame, tickers: list[str]) -> np.ndarray:
+    """Cash levels grow by daily CDI in BRL; USD portfolios divide by USD/BRL."""
+    previous = pd.Timestamp(returns.attrs["first_price_date"])
+    dates = pd.DatetimeIndex([previous]).append(returns.index)
+    cdi = _cdi_cached(previous.date(), dates[-1].date(), int(time.time() // 86400))
+    daily = cdi.reindex(pd.date_range(previous, dates[-1], freq="D"), fill_value=0.)
+    levels = (1 + daily).cumprod().reindex(dates).to_numpy()
+    if any(not name.endswith(".SA") for name in tickers):
+        fx = _fx_cached((previous - timedelta(days=7)).date(), dates[-1].date(), int(time.time() // 900))
+        aligned = fx.reindex(dates, method="ffill")
+        if aligned.isna().any():
+            raise HTTPException(502, "USD/BRL sem cobertura para toda a janela do caixa CDI.")
+        levels = levels / aligned.to_numpy()
+    cash = levels[1:] / levels[:-1] - 1
+    if not np.isfinite(cash).all() or np.any(cash <= -1):
+        raise HTTPException(502, "Retornos inválidos do caixa CDI.")
+    return cash
 
 
 @lru_cache(maxsize=128)
@@ -189,33 +258,40 @@ def _budget_metrics(portfolio: np.ndarray) -> dict[str, float]:
 
 
 def _risk_budget(portfolio: np.ndarray, weights: pd.Series,
-                 limits: dict[str, float]) -> dict:
-    """Scale risky weights by a in [0,1] and hold 1-a in zero-return cash.
-
-    VaR, ES and volatility scale linearly with a. The exact compounded
-    drawdown is checked on a vectorized grid before recommending weights.
-    """
+                 limits: dict[str, float], cash_returns: np.ndarray | None = None) -> dict:
+    """R(a)=a*R_risky+(1-a)*R_CDI; evaluate VaR, ES, vol and drawdown on each a."""
     selected = _budget_metrics(portfolio)
     breaches = [{"metric": key, "actual": selected[key], "limit": limit}
                 for key, limit in limits.items() if selected[key] > limit + 1e-10]
     scale = 1.
+    after = selected
     if breaches:
-        for key in ("var_99", "es_99", "volatility_annual"):
-            if selected[key] > 0:
-                scale = min(scale, limits[key] / selected[key])
-        candidates = np.linspace(0, max(0., min(1., scale)), 501)
-        paths = np.cumprod(1 + portfolio[:, None] * candidates[None, :], axis=0)
+        if cash_returns is None:
+            raise ValueError("CDI cash returns are required for a breached allocation")
+        candidates = np.linspace(0, 1, 1001)
+        scenarios = cash_returns[:, None] + (portfolio - cash_returns)[:, None] * candidates[None, :]
+        loss = -scenarios
+        var = np.quantile(loss, .99, axis=0)
+        es = np.sum(np.where(loss >= var[None, :], loss, 0.), axis=0) / np.sum(loss >= var[None, :], axis=0)
+        vol = scenarios.std(axis=0, ddof=1) * np.sqrt(252)
+        paths = np.cumprod(1 + scenarios, axis=0)
         peaks = np.maximum.accumulate(np.vstack([np.ones((1, len(candidates))), paths]), axis=0)[1:]
         drawdowns = 1 - paths / peaks
-        feasible = np.flatnonzero(drawdowns.max(axis=0) <= limits["max_drawdown"] + 1e-10)
+        feasible = np.flatnonzero((var <= limits["var_99"]) & (es <= limits["es_99"])
+                                  & (vol <= limits["volatility_annual"])
+                                  & (drawdowns.max(axis=0) <= limits["max_drawdown"]))
         scale = float(candidates[feasible[-1]]) if len(feasible) else 0.
-        scale = max(0., scale - 1e-9)
+        after = _budget_metrics(cash_returns + (portfolio - cash_returns) * scale)
     recommended = {name: float(value * scale) for name, value in weights.items()}
     recommended["CAIXA"] = float(1 - scale)
-    after = _budget_metrics(portfolio * scale)
     return {"breaches": breaches,
             "selected_metrics": selected, "recommended_metrics": after,
             "recommended_weights": recommended, "risk_scale": scale,
+            "cash_return_annual": (float(np.prod(1 + cash_returns) ** (252 / len(cash_returns)) - 1)
+                                   if cash_returns is not None else None),
+            "recommended_return_annual": float(np.prod(1 + (cash_returns + (portfolio - cash_returns) * scale)
+                                                      if cash_returns is not None else (1 + portfolio))
+                                               ** (252 / len(portfolio)) - 1),
             "compliant": all(after[key] <= limit + 1e-8 for key, limit in limits.items())}
 
 
@@ -272,7 +348,9 @@ def portfolio_risk(request: PortfolioRequest) -> dict:
     })
     limits = {"var_99": request.var_limit, "es_99": request.es_limit,
               "volatility_annual": request.volatility_limit, "max_drawdown": request.drawdown_limit}
-    risk_budget = _risk_budget(portfolio, weights, limits)
+    cash_returns = _cash_returns(returns, request.tickers) if any(
+        metrics[key] > limit + 1e-10 for key, limit in limits.items()) else None
+    risk_budget = _risk_budget(portfolio, weights, limits, cash_returns)
     risk_budget["selected_method"] = request.method
     return {"tickers": request.tickers, "method": request.method, "weights": weights.to_dict(),
             "metrics": metrics, "limits": limits, "dates": returns.index.strftime("%Y-%m-%d").tolist(),
