@@ -2,8 +2,7 @@
 from dataclasses import dataclass
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
-from scipy.optimize import minimize
-from scipy.stats import t
+from arch import arch_model
 
 
 def ewma_volatility(returns: ArrayLike, decay: float = 0.94, initial_variance: float | None = None) -> NDArray[np.float64]:
@@ -35,37 +34,30 @@ class GarchFit:
 
 
 def fit_garch(returns: ArrayLike, *, asymmetric: bool = False) -> GarchFit:
-    """Fit Student-t GARCH/GJR: h[t]=omega+alpha*e[t-1]^2+gamma*I(e<0)*e^2+beta*h[t-1]."""
+    """Fit Student-t GARCH/GJR: h[t]=omega+(alpha+gamma I[e<0])e[t-1]^2+beta h[t-1]."""
     x = np.asarray(returns, float)
     if x.ndim != 1 or len(x) < 100 or not np.isfinite(x).all() or np.std(x) <= 0:
         raise ValueError("at least 100 nonconstant finite returns required")
     scale = 100.0
-    y = x*scale
-    sample_variance = float(np.var(y, ddof=1))
-
-    def likelihood(p: NDArray[np.float64]) -> float:
-        omega, alpha, gamma, beta, nu, mean = p
-        if alpha + beta + gamma/2 >= .999:
-            return 1e12
-        e = y-mean
-        h = np.empty(len(y))
-        h[0] = sample_variance
-        for i in range(1, len(y)):
-            h[i] = omega + (alpha + gamma*(e[i-1] < 0))*e[i-1]**2 + beta*h[i-1]
-        standardized = e/np.sqrt(h)
-        return float(np.sum(.5*np.log(h)-t.logpdf(standardized*np.sqrt(nu/(nu-2)), nu)+.5*np.log((nu-2)/nu)))
-
-    initial = np.array([sample_variance*.05, .06, .04 if asymmetric else 0., .87, 7., float(y.mean())])
-    bounds = [(1e-9, sample_variance*10), (1e-6, .5), (0., .5) if asymmetric else (0., 0.), (.01, .999), (2.05, 100.), (float(y.mean()-5*np.std(y)), float(y.mean()+5*np.std(y)))]
-    result = minimize(likelihood, initial, method="L-BFGS-B", bounds=bounds)
-    if not result.success and not np.isfinite(result.fun):
-        raise RuntimeError("GARCH optimization failed")
-    omega, alpha, gamma, beta, nu, mean = result.x
-    e = y-mean
-    h_last = sample_variance
-    for shock in e[:-1]:
-        h_last = omega + (alpha + gamma*(shock < 0))*shock**2 + beta*h_last
-    return GarchFit(float(omega), float(alpha), float(beta), float(gamma), float(nu), float(mean), float(h_last), float(e[-1]), scale)
+    y = x * scale
+    model = arch_model(y, mean="Constant", vol="GARCH", p=1,
+                       o=1 if asymmetric else 0, q=1,
+                       dist="StudentsT", rescale=False)
+    result = model.fit(disp="off", show_warning=False, options={"maxiter": 300})
+    parameters = result.params
+    omega = float(parameters["omega"])
+    alpha = float(parameters["alpha[1]"])
+    gamma = float(parameters.get("gamma[1]", 0.))
+    beta = float(parameters["beta[1]"])
+    nu = float(parameters["nu"])
+    mean = float(parameters["mu"])
+    last_variance = float(result.conditional_volatility[-1] ** 2)
+    last_residual = float(result.resid[-1])
+    if not np.isfinite([omega, alpha, gamma, beta, nu, mean,
+                        last_variance, last_residual]).all() or nu <= 2 or last_variance <= 0:
+        raise RuntimeError("GARCH returned invalid parameters")
+    return GarchFit(omega, alpha, beta, gamma, nu, mean,
+                    last_variance, last_residual, scale)
 
 
 def forecast_garch(fit: GarchFit) -> tuple[float, float]:
