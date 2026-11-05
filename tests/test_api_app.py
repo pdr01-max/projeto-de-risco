@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 import pytest
+import json
 import api_app
 
 
@@ -12,7 +13,9 @@ def prices(monkeypatch):
                           index=pd.date_range("2025-01-01", periods=250, freq="B"),
                           columns=["AAPL", "PETR4.SA"])
     monkeypatch.setattr(api_app, "_download_cached", lambda tickers, period, bucket, start=None, end=None: prices)
+    monkeypatch.setattr(api_app, "_fx_cached", lambda start, end, bucket: pd.Series(5., index=prices.index))
     monkeypatch.setattr(api_app, "_cash_returns", lambda returns, tickers: np.full(len(returns), .0004))
+    monkeypatch.setattr(api_app, "_stress_tests", lambda request, weights, bucket: [])
     return prices
 
 
@@ -74,3 +77,61 @@ def test_unattainable_cash_limit_is_reported():
               "volatility_annual": .01, "max_drawdown": .01}
     result = api_app._risk_budget(risky, pd.Series({"AAPL": 1.}), limits, cash)
     assert not result["compliant"]
+
+
+def test_brl_conversion_and_strict_calendar(monkeypatch):
+    dates = pd.date_range("2026-01-05", periods=83, freq="B")
+    prices = pd.DataFrame({"AAPL": 100 + np.arange(83),
+                           "PETR4.SA": 30 + np.arange(83)/10}, index=dates)
+    prices.loc[dates[20], "PETR4.SA"] = np.nan
+    monkeypatch.setattr(api_app, "_download_cached", lambda *args: prices)
+    monkeypatch.setattr(api_app, "_fx_cached", lambda *args: pd.Series(5., index=dates))
+    request = api_app.PortfolioRequest(tickers=["AAPL", "PETR4.SA"], weights=[.5, .5])
+    returns = api_app._returns(request)
+    assert len(returns) == 81
+    assert dates[20] not in returns.index
+    assert np.isclose(returns.loc[dates[1], "AAPL"], 505/500-1)
+
+
+def test_model_backtest_and_json(prices):
+    for model in ("historical", "normal", "ewma", "monte_carlo"):
+        result = api_app.portfolio_risk(api_app.PortfolioRequest(
+            tickers=["AAPL", "PETR4.SA"], weights=[.5, .5], var_model=model,
+            base_currency="BRL", capital=100000))
+        assert result["backtest"]["observations"] > 0
+        assert np.isclose(sum(result["risk_contribution"].values()), 1)
+        json.dumps(result, allow_nan=False)
+
+
+def test_backtest_forecasts_do_not_see_realized_day():
+    rng = np.random.default_rng(88)
+    returns = rng.normal(0, .01, 300)
+    dates = pd.date_range("2025-01-01", periods=300, freq="B")
+    first = api_app._backtest(returns, dates, "historical")
+    returns[-1] = -.5
+    second = api_app._backtest(returns, dates, "historical")
+    assert first["forecast_var"] == second["forecast_var"]
+    assert second["breaches"] == first["breaches"] + 1
+
+
+def test_purchase_split_adjusts_share_count(prices, monkeypatch):
+    monkeypatch.setattr(api_app, "_latest_close_cached", lambda *args: {"AAPL": 60.})
+    monkeypatch.setattr(api_app, "_splits_cached", lambda *args: 2.)
+    result = api_app.portfolio_risk(api_app.PortfolioRequest(
+        tickers=["AAPL", "PETR4.SA"], weights=[1., 0.],
+        purchases={"AAPL": {"date": "2025-01-10", "price": 100., "quantity": 10.}}))
+    lot = result["purchase_analysis"][0]
+    assert lot["adjusted_quantity"] == 20
+    assert lot["cost"] == 1000
+    assert lot["market_value"] == 1200
+    assert lot["pnl"] == 200
+
+
+def test_garch_forecast_and_out_of_sample():
+    rng = np.random.default_rng(44)
+    returns = rng.standard_t(7, 150) * .01
+    var, es = api_app._model_var_es(returns, "garch")
+    result = api_app._backtest(returns, pd.date_range("2025-01-01", periods=150, freq="B"), "garch")
+    assert np.isfinite([var, es, result["p_value"]]).all()
+    assert es >= var
+    assert result["observations"] == 50
