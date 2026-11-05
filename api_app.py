@@ -214,12 +214,16 @@ def portfolio_risk(request: PortfolioRequest) -> dict:
         for symbol, purchase in request.purchases.items():
             price, quantity = float(purchase["price"]), float(purchase["quantity"])
             latest = current[symbol]
+            holding_days = (date.today() - date.fromisoformat(str(purchase["date"]))).days
             purchase_analysis.append({
                 "ticker": symbol, "date": str(purchase["date"]),
                 "currency": "BRL" if symbol.endswith(".SA") else "USD",
                 "quantity": quantity, "purchase_price": price, "current_price": latest,
                 "cost": price * quantity, "market_value": latest * quantity,
                 "pnl": (latest - price) * quantity, "return": latest / price - 1,
+                "holding_days": holding_days,
+                "return_annualized": (latest / price) ** (365.25 / holding_days) - 1
+                                     if holding_days > 0 else None,
             })
     metrics.update({
         "return_annual": float(np.prod(1 + portfolio) ** (252 / len(portfolio)) - 1),
