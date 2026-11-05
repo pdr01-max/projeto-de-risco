@@ -47,6 +47,7 @@ function renderRisk(data) {
   $('downside-vol').textContent = pct(data.metrics.downside_volatility_annual);
   $('var-95').textContent = pct(data.metrics.var_95);
   $('worst-day').textContent = pct(data.metrics.worst_day);
+  renderRiskBudget(data);
   const purchasePanel = $('purchase-panel');
   purchasePanel.hidden = !data.purchase_analysis?.length;
   const purchaseBody = $('purchase-results');
@@ -54,13 +55,14 @@ function renderRisk(data) {
   (data.purchase_analysis || []).forEach(item => {
     const row = document.createElement('tr');
     const money = value => new Intl.NumberFormat('pt-BR', { style: 'currency', currency: item.currency }).format(value);
-    [item.ticker, item.date, item.quantity, money(item.purchase_price), money(item.current_price),
-      money(item.cost), money(item.market_value), money(item.pnl), pct(item.return)].forEach(value => {
+    [item.ticker, item.date, item.holding_days, item.quantity, money(item.purchase_price), money(item.current_price),
+      money(item.cost), money(item.market_value), money(item.pnl), pct(item.return),
+      item.return_annualized === null ? '—' : pct(item.return_annualized)].forEach(value => {
       const cell = document.createElement('td');
       cell.textContent = value;
       row.append(cell);
     });
-    row.lastElementChild.style.color = item.return >= 0 ? '#77c99a' : '#f17e75';
+    [...row.children].slice(-2).forEach(cell => { cell.style.color = item.return >= 0 ? '#77c99a' : '#f17e75'; });
     purchaseBody.append(row);
   });
   Plotly.react('drawdown-chart', [{ x: data.dates, y: data.drawdown.map(x => x * 100),
@@ -94,6 +96,52 @@ function renderRisk(data) {
     shapes: [{ type: 'line', x0: data.metrics.var_99 * 100, x1: data.metrics.var_99 * 100,
       y0: 0, y1: 1, yref: 'paper', line: { color: chartColors.red, width: 2, dash: 'dash' } }]
   }), config);
+}
+
+function renderRiskBudget(data) {
+  const budget = data.risk_budget;
+  $('rebalance-panel').hidden = false;
+  $('rebalance-method').textContent = $('method').selectedOptions[0].textContent;
+  const status = $('rebalance-status');
+  status.textContent = budget.breaches.length
+    ? `${budget.breaches.length} limite(s) violado(s) pela alocação selecionada. Exposição sugerida: ${pct(budget.risk_scale)} em ativos e ${pct(1 - budget.risk_scale)} em caixa.`
+    : 'A alocação selecionada respeita todos os limites informados.';
+  status.className = budget.breaches.length ? 'status error mt-3 mb-2' : 'status mt-3 mb-2';
+  const names = { var_99: 'VaR 99%', es_99: 'ES 99%', volatility_annual: 'Volatilidade anual', max_drawdown: 'Max drawdown' };
+  const breachList = $('breach-list');
+  breachList.replaceChildren();
+  budget.breaches.forEach(item => {
+    const line = document.createElement('div');
+    line.className = 'breach-item';
+    line.textContent = `${names[item.metric]}: ${pct(item.actual)} acima do limite de ${pct(item.limit)}.`;
+    breachList.append(line);
+  });
+  const metricsBody = $('risk-budget-results');
+  metricsBody.replaceChildren();
+  Object.entries(names).forEach(([key, name]) => {
+    const row = document.createElement('tr');
+    [name, pct(budget.selected_metrics[key]), pct(data.limits[key]), pct(budget.recommended_metrics[key])].forEach(value => {
+      const cell = document.createElement('td'); cell.textContent = value; row.append(cell);
+    });
+    if (budget.selected_metrics[key] > data.limits[key]) row.children[1].style.color = chartColors.red;
+    metricsBody.append(row);
+  });
+  const assets = [...data.tickers, 'CAIXA'];
+  const weightsBody = $('rebalance-weights');
+  weightsBody.replaceChildren();
+  assets.forEach(asset => {
+    const before = data.weights[asset] || 0;
+    const after = budget.recommended_weights[asset] || 0;
+    const row = document.createElement('tr');
+    [asset, pct(before), pct(after), ((after - before) * 100).toFixed(2)].forEach(value => {
+      const cell = document.createElement('td'); cell.textContent = value; row.append(cell);
+    });
+    weightsBody.append(row);
+  });
+  Plotly.react('rebalance-chart', [
+    { x: assets, y: assets.map(x => (data.weights[x] || 0) * 100), type: 'bar', name: 'Selecionada', marker: { color: chartColors.steel } },
+    { x: assets, y: assets.map(x => (budget.recommended_weights[x] || 0) * 100), type: 'bar', name: 'Sugerida', marker: { color: chartColors.amber } }
+  ], layout({ barmode: 'group', yaxis: { title: 'Peso (%)', gridcolor: chartColors.grid } }), config);
 }
 
 function renderWeights(data) {

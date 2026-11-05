@@ -135,6 +135,7 @@ h1 { font-size: clamp(1.7rem, 3vw, 2.55rem); font-weight: 650; letter-spacing: -
 .purchase-input .form-control { min-width: 0; font-size: .78rem; }
 .purchase-table { --bs-table-bg: transparent; --bs-table-color: var(--text); --bs-table-border-color: var(--border); white-space: nowrap; }
 .purchase-table th { color: var(--muted); font-size: .73rem; font-weight: 500; }
+.breach-item { border-left: 3px solid var(--red); background: #f17e7515; color: var(--text); padding: .5rem .75rem; margin-bottom: .4rem; font-size: .82rem; }
 
 @media (max-width: 576px) {
   .chart { height: 280px; }
