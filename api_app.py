@@ -178,6 +178,47 @@ def _optimize(returns: pd.DataFrame, method: str) -> pd.Series:
     raise HTTPException(422, "Método de otimização inválido")
 
 
+def _budget_metrics(portfolio: np.ndarray) -> dict[str, float]:
+    """Historical VaR/ES and compounded drawdown for a fixed allocation."""
+    wealth = np.cumprod(1 + portfolio)
+    drawdown = wealth / np.maximum.accumulate(np.r_[1., wealth])[1:] - 1
+    var, es = historical_var_es(portfolio, .99)
+    return {"var_99": float(var), "es_99": float(es),
+            "volatility_annual": float(portfolio.std(ddof=1) * np.sqrt(252)),
+            "max_drawdown": float(-drawdown.min())}
+
+
+def _risk_budget(portfolio: np.ndarray, weights: pd.Series,
+                 limits: dict[str, float]) -> dict:
+    """Scale risky weights by a in [0,1] and hold 1-a in zero-return cash.
+
+    VaR, ES and volatility scale linearly with a. The exact compounded
+    drawdown is checked on a vectorized grid before recommending weights.
+    """
+    selected = _budget_metrics(portfolio)
+    breaches = [{"metric": key, "actual": selected[key], "limit": limit}
+                for key, limit in limits.items() if selected[key] > limit + 1e-10]
+    scale = 1.
+    if breaches:
+        for key in ("var_99", "es_99", "volatility_annual"):
+            if selected[key] > 0:
+                scale = min(scale, limits[key] / selected[key])
+        candidates = np.linspace(0, max(0., min(1., scale)), 501)
+        paths = np.cumprod(1 + portfolio[:, None] * candidates[None, :], axis=0)
+        peaks = np.maximum.accumulate(np.vstack([np.ones((1, len(candidates))), paths]), axis=0)[1:]
+        drawdowns = 1 - paths / peaks
+        feasible = np.flatnonzero(drawdowns.max(axis=0) <= limits["max_drawdown"] + 1e-10)
+        scale = float(candidates[feasible[-1]]) if len(feasible) else 0.
+        scale = max(0., scale - 1e-9)
+    recommended = {name: float(value * scale) for name, value in weights.items()}
+    recommended["CAIXA"] = float(1 - scale)
+    after = _budget_metrics(portfolio * scale)
+    return {"breaches": breaches,
+            "selected_metrics": selected, "recommended_metrics": after,
+            "recommended_weights": recommended, "risk_scale": scale,
+            "compliant": all(after[key] <= limit + 1e-8 for key, limit in limits.items())}
+
+
 @app.get("/")
 def index() -> FileResponse:
     return FileResponse(STATIC / "index.html")
@@ -196,10 +237,7 @@ def portfolio_risk(request: PortfolioRequest) -> dict:
     portfolio = returns.to_numpy() @ weights.loc[request.tickers].to_numpy()
     wealth = np.cumprod(1 + portfolio)
     drawdown = wealth / np.maximum.accumulate(np.r_[1., wealth])[1:] - 1
-    var, es = historical_var_es(portfolio, .99)
-    metrics = {"var_99": float(var), "es_99": float(es),
-               "volatility_annual": float(portfolio.std(ddof=1) * np.sqrt(252)),
-               "max_drawdown": float(-drawdown.min())}
+    metrics = _budget_metrics(portfolio)
     rolling_vol = pd.Series(portfolio).rolling(21, min_periods=21).std().mul(np.sqrt(252))
     covariance = returns.cov().to_numpy()
     w = weights.loc[request.tickers].to_numpy()
@@ -234,6 +272,8 @@ def portfolio_risk(request: PortfolioRequest) -> dict:
     })
     limits = {"var_99": request.var_limit, "es_99": request.es_limit,
               "volatility_annual": request.volatility_limit, "max_drawdown": request.drawdown_limit}
+    risk_budget = _risk_budget(portfolio, weights, limits)
+    risk_budget["selected_method"] = request.method
     return {"tickers": request.tickers, "method": request.method, "weights": weights.to_dict(),
             "metrics": metrics, "limits": limits, "dates": returns.index.strftime("%Y-%m-%d").tolist(),
             "wealth_index": wealth.tolist(), "daily_losses": (-portfolio).tolist(),
@@ -242,6 +282,7 @@ def portfolio_risk(request: PortfolioRequest) -> dict:
             "correlation": correlation.tolist(),
             "risk_contribution": dict(zip(request.tickers, risk_contribution.tolist())),
             "purchase_analysis": purchase_analysis,
+            "risk_budget": risk_budget,
             "observations": len(returns)}
 
 
