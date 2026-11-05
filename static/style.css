@@ -130,6 +130,11 @@ h1 { font-size: clamp(1.7rem, 3vw, 2.55rem); font-weight: 650; letter-spacing: -
 .secondary-metric { padding: 1rem 1.2rem; display: flex; flex-direction: column; gap: .45rem; }
 .secondary-metric span { color: var(--muted); font-family: "IBM Plex Mono", Consolas, monospace; font-size: .7rem; text-transform: uppercase; }
 .secondary-metric strong { font-family: "IBM Plex Mono", Consolas, monospace; font-size: 1.25rem; font-weight: 600; }
+.purchase-input { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: .4rem; margin-bottom: .85rem; }
+.purchase-input .ticker-name { grid-column: 1 / -1; color: var(--accent); font-family: "IBM Plex Mono", Consolas, monospace; font-size: .75rem; }
+.purchase-input .form-control { min-width: 0; font-size: .78rem; }
+.purchase-table { --bs-table-bg: transparent; --bs-table-color: var(--text); --bs-table-border-color: var(--border); white-space: nowrap; }
+.purchase-table th { color: var(--muted); font-size: .73rem; font-weight: 500; }
 
 @media (max-width: 576px) {
   .chart { height: 280px; }

@@ -47,6 +47,22 @@ function renderRisk(data) {
   $('downside-vol').textContent = pct(data.metrics.downside_volatility_annual);
   $('var-95').textContent = pct(data.metrics.var_95);
   $('worst-day').textContent = pct(data.metrics.worst_day);
+  const purchasePanel = $('purchase-panel');
+  purchasePanel.hidden = !data.purchase_analysis?.length;
+  const purchaseBody = $('purchase-results');
+  purchaseBody.replaceChildren();
+  (data.purchase_analysis || []).forEach(item => {
+    const row = document.createElement('tr');
+    const money = value => new Intl.NumberFormat('pt-BR', { style: 'currency', currency: item.currency }).format(value);
+    [item.ticker, item.date, item.quantity, money(item.purchase_price), money(item.current_price),
+      money(item.cost), money(item.market_value), money(item.pnl), pct(item.return)].forEach(value => {
+      const cell = document.createElement('td');
+      cell.textContent = value;
+      row.append(cell);
+    });
+    row.lastElementChild.style.color = item.return >= 0 ? '#77c99a' : '#f17e75';
+    purchaseBody.append(row);
+  });
   Plotly.react('drawdown-chart', [{ x: data.dates, y: data.drawdown.map(x => x * 100),
     type: 'scatter', mode: 'lines', line: { color: chartColors.red, width: 2 },
     fill: 'tozeroy', fillcolor: 'rgba(241,126,117,.12)',
@@ -110,6 +126,31 @@ function refreshWeights() {
     row.append(label, input, sign); holder.append(row);
   });
   updateTotal();
+  refreshPurchases(names);
+}
+function refreshPurchases(names) {
+  const holder = $('purchase-inputs');
+  const old = Object.fromEntries([...holder.querySelectorAll('.purchase-input')].map(row =>
+    [row.dataset.ticker, [...row.querySelectorAll('input')].map(input => input.value)]));
+  holder.replaceChildren();
+  names.forEach(name => {
+    const row = document.createElement('div');
+    row.className = 'purchase-input';
+    row.dataset.ticker = name;
+    const label = document.createElement('strong');
+    label.className = 'ticker-name';
+    label.textContent = name;
+    row.append(label);
+    [['date', 'Data da compra', 'date'], ['price', 'Preço pago', 'number'], ['quantity', 'Quantidade', 'number']].forEach(([field, placeholder, type], i) => {
+      const input = document.createElement('input');
+      input.type = type; input.className = 'form-control';
+      input.dataset.field = field; input.setAttribute('aria-label', name + ' — ' + placeholder);
+      input.placeholder = placeholder; input.value = old[name]?.[i] || '';
+      if (type === 'number') { input.min = '0.000001'; input.step = 'any'; }
+      row.append(input);
+    });
+    holder.append(row);
+  });
 }
 function updateTotal() {
   const total = [...document.querySelectorAll('.weight-input')].reduce((s, x) => s + Number(x.value), 0);
@@ -120,6 +161,7 @@ function toggleMethod() { $('manual-weights').hidden = $('method').value !== 'ma
 let tickerTimer;
 $('tickers').addEventListener('input', () => { clearTimeout(tickerTimer); tickerTimer = setTimeout(refreshWeights, 250); });
 $('method').addEventListener('change', toggleMethod);
+$('period').addEventListener('change', () => { $('custom-dates').hidden = $('period').value !== 'custom'; });
 document.querySelectorAll('.preset').forEach(button => button.addEventListener('click', () => { $('tickers').value = button.dataset.tickers; refreshWeights(); }));
 refreshWeights(); toggleMethod();
 
@@ -132,11 +174,30 @@ $('risk-form').addEventListener('submit', async (event) => {
     es_limit: Number($('es-limit').value) / 100,
     volatility_limit: Number($('vol-limit').value) / 100,
     drawdown_limit: Number($('dd-limit').value) / 100 };
+  if (payload.period === 'custom') {
+    payload.start_date = $('start-date').value;
+    payload.end_date = $('end-date').value;
+  }
+  payload.purchases = {};
+  let purchaseError = '';
+  document.querySelectorAll('.purchase-input').forEach(row => {
+    const values = Object.fromEntries([...row.querySelectorAll('input')].map(input => [input.dataset.field, input.value]));
+    if (Object.values(values).some(Boolean)) {
+      if (!values.date || !values.price || !values.quantity || Number(values.price) <= 0 || Number(values.quantity) <= 0) {
+        purchaseError = `Complete data, preço e quantidade para ${row.dataset.ticker}.`;
+      }
+      payload.purchases[row.dataset.ticker] = { date: values.date, price: Number(values.price), quantity: Number(values.quantity) };
+    }
+  });
   const button = $('run-button');
   button.disabled = true;
   $('status').classList.remove('error');
   $('status').textContent = 'Baixando preços e calculando riscos…';
   try {
+    if (purchaseError) throw new Error(purchaseError);
+    if (payload.period === 'custom' && (!payload.start_date || !payload.end_date || payload.start_date >= payload.end_date)) {
+      throw new Error('Informe um intervalo histórico válido.');
+    }
     if (!tickers.length || !payload.var_limit || !payload.es_limit || !payload.volatility_limit || !payload.drawdown_limit) {
       throw new Error('Informe tickers e limites positivos.');
     }
