@@ -157,11 +157,30 @@ def portfolio_risk(request: PortfolioRequest) -> dict:
     metrics = {"var_99": float(var), "es_99": float(es),
                "volatility_annual": float(portfolio.std(ddof=1) * np.sqrt(252)),
                "max_drawdown": float(-drawdown.min())}
+    rolling_vol = pd.Series(portfolio).rolling(21, min_periods=21).std().mul(np.sqrt(252))
+    covariance = returns.cov().to_numpy()
+    w = weights.loc[request.tickers].to_numpy()
+    portfolio_vol = float(np.sqrt(w @ covariance @ w))
+    risk_contribution = (np.sqrt(252) * w * (covariance @ w) / portfolio_vol
+                         if portfolio_vol > 0 else np.zeros_like(w))
+    correlation = returns.corr().fillna(0).to_numpy()
+    np.fill_diagonal(correlation, 1.)
+    metrics.update({
+        "return_annual": float(np.prod(1 + portfolio) ** (252 / len(portfolio)) - 1),
+        "downside_volatility_annual": float(np.sqrt(np.mean(np.minimum(portfolio, 0) ** 2) * 252)),
+        "best_day": float(portfolio.max()),
+        "worst_day": float(portfolio.min()),
+        "var_95": float(historical_var_es(portfolio, .95)[0]),
+    })
     limits = {"var_99": request.var_limit, "es_99": request.es_limit,
               "volatility_annual": request.volatility_limit, "max_drawdown": request.drawdown_limit}
     return {"tickers": request.tickers, "method": request.method, "weights": weights.to_dict(),
             "metrics": metrics, "limits": limits, "dates": returns.index.strftime("%Y-%m-%d").tolist(),
             "wealth_index": wealth.tolist(), "daily_losses": (-portfolio).tolist(),
+            "drawdown": drawdown.tolist(),
+            "rolling_volatility_21d": [None if pd.isna(v) else float(v) for v in rolling_vol],
+            "correlation": correlation.tolist(),
+            "risk_contribution": dict(zip(request.tickers, risk_contribution.tolist())),
             "observations": len(returns)}
 
 
