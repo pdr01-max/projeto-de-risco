@@ -104,12 +104,12 @@ function renderRiskBudget(data) {
   $('rebalance-method').textContent = $('method').selectedOptions[0].textContent;
   const status = $('rebalance-status');
   status.textContent = budget.breaches.length
-    ? `${budget.breaches.length} limite(s) violado(s). ${budget.compliant ? 'Exposição sugerida' : 'Nenhuma combinação com caixa CDI atende a todos os limites nesta janela'}: ${pct(budget.risk_scale)} em ativos e ${pct(1 - budget.risk_scale)} em caixa.`
+    ? `${budget.breaches.length} limite(s) violado(s). ${budget.compliant ? 'Exposição sugerida' : 'Nenhuma combinação com caixa CDI atende a todos os limites nesta janela. O cenário abaixo é 100% caixa e também viola os limites'}: ${pct(budget.risk_scale)} em ativos e ${pct(1 - budget.risk_scale)} em caixa.`
     : 'A alocação selecionada respeita todos os limites informados.';
   status.className = budget.breaches.length ? 'status error mt-3 mb-2' : 'status mt-3 mb-2';
   $('cash-note').textContent = budget.cash_return_annual === null
     ? 'Nenhum rebalanceamento necessário.'
-    : `Caixa: 100% do CDI histórico em BRL, antes de taxas e impostos${data.tickers.some(x => !x.endsWith('.SA')) ? ', convertido para USD pela série USD/BRL' : ''}. Retorno anualizado do caixa: ${pct(budget.cash_return_annual)}; da alocação sugerida: ${pct(budget.recommended_return_annual)}. Os pesos são simulados com rebalanceamento diário e não representam ordens de negociação.`;
+    : `Caixa: 100% do CDI histórico em BRL, antes de taxas e impostos${data.tickers.some(x => !x.endsWith('.SA')) ? ', convertido para USD pela série USD/BRL' : ''}. Retorno anualizado do caixa: ${pct(budget.cash_return_annual)}; do cenário: ${pct(budget.recommended_return_annual)}. Os pesos são simulados com rebalanceamento diário e não representam ordens de negociação.`;
   const names = { var_99: 'VaR 99%', es_99: 'ES 99%', volatility_annual: 'Volatilidade anual', max_drawdown: 'Max drawdown' };
   const breachList = $('breach-list');
   breachList.replaceChildren();
@@ -143,7 +143,7 @@ function renderRiskBudget(data) {
   });
   Plotly.react('rebalance-chart', [
     { x: assets, y: assets.map(x => (data.weights[x] || 0) * 100), type: 'bar', name: 'Selecionada', marker: { color: chartColors.steel } },
-    { x: assets, y: assets.map(x => (budget.recommended_weights[x] || 0) * 100), type: 'bar', name: 'Sugerida', marker: { color: chartColors.amber } }
+    { x: assets, y: assets.map(x => (budget.recommended_weights[x] || 0) * 100), type: 'bar', name: budget.compliant ? 'Sugerida' : 'Não conforme', marker: { color: chartColors.amber } }
   ], layout({ barmode: 'group', yaxis: { title: 'Peso (%)', gridcolor: chartColors.grid } }), config);
 }
 
