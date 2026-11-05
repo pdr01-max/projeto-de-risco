@@ -43,6 +43,29 @@ function renderRisk(data) {
   setAlert('vol', data.metrics.volatility_annual, data.limits.volatility_annual);
   setAlert('dd', data.metrics.max_drawdown, data.limits.max_drawdown);
   $('es-value').textContent = pct(data.metrics.es_99);
+  $('return-annual').textContent = pct(data.metrics.return_annual);
+  $('downside-vol').textContent = pct(data.metrics.downside_volatility_annual);
+  $('var-95').textContent = pct(data.metrics.var_95);
+  $('worst-day').textContent = pct(data.metrics.worst_day);
+  Plotly.react('drawdown-chart', [{ x: data.dates, y: data.drawdown.map(x => x * 100),
+    type: 'scatter', mode: 'lines', line: { color: chartColors.red, width: 2 },
+    fill: 'tozeroy', fillcolor: 'rgba(241,126,117,.12)',
+    hovertemplate: '%{x}<br>Drawdown: %{y:.2f}%<extra></extra>'
+  }], layout({ yaxis: { title: 'Drawdown (%)', gridcolor: chartColors.grid } }), config);
+  Plotly.react('rolling-vol-chart', [{ x: data.dates, y: data.rolling_volatility_21d.map(x => x === null ? null : x * 100),
+    type: 'scatter', mode: 'lines', line: { color: chartColors.amber, width: 2 },
+    hovertemplate: '%{x}<br>Volatilidade: %{y:.2f}%<extra></extra>'
+  }], layout({ yaxis: { title: 'Volatilidade (%)', gridcolor: chartColors.grid } }), config);
+  Plotly.react('correlation-chart', [{
+    x: data.tickers, y: data.tickers, z: data.correlation, type: 'heatmap',
+    zmin: -1, zmax: 1, zmid: 0, colorscale: [[0, '#9a524f'], [.5, '#2a3033'], [1, '#e9ad45']],
+    hovertemplate: '%{x} × %{y}<br>Correlação: %{z:.2f}<extra></extra>'
+  }], layout({ margin: { l: 70, r: 20, t: 24, b: 55 } }), config);
+  Plotly.react('contribution-chart', [{
+    x: data.tickers, y: data.tickers.map(x => data.risk_contribution[x] * 100),
+    type: 'bar', marker: { color: chartColors.steel },
+    hovertemplate: '%{x}<br>Contribuição: %{y:.2f} p.p.<extra></extra>'
+  }], layout({ yaxis: { title: 'Pontos percentuais', gridcolor: chartColors.grid } }), config);
   Plotly.react('wealth-chart', [{ x: data.dates, y: data.wealth_index, type: 'scatter',
     mode: 'lines', line: { color: chartColors.amber, width: 2.5 },
     fill: 'tozeroy', fillcolor: 'rgba(233,173,69,.10)', hovertemplate: '%{x}<br>Índice: %{y:.3f}<extra></extra>'

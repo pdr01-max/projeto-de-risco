@@ -51,10 +51,22 @@
           <div class="col-md-4"><div class="metric panel" id="card-vol"><div class="metric-label">Volatilidade anual</div><div class="metric-value" id="value-vol">—</div><div class="metric-limit" id="limit-vol">Limite: —</div><div class="traffic">Aguardando cálculo</div></div></div>
           <div class="col-md-4"><div class="metric panel" id="card-dd"><div class="metric-label">Max drawdown</div><div class="metric-value" id="value-dd">—</div><div class="metric-limit" id="limit-dd">Limite: —</div><div class="traffic">Aguardando cálculo</div></div></div>
         </section>
+        <section class="row g-3 mb-4" aria-label="Métricas complementares">
+          <div class="col-sm-6 col-lg-3"><div class="panel secondary-metric"><span>Retorno anualizado</span><strong id="return-annual">—</strong></div></div>
+          <div class="col-sm-6 col-lg-3"><div class="panel secondary-metric"><span>Volatilidade de queda</span><strong id="downside-vol">—</strong></div></div>
+          <div class="col-sm-6 col-lg-3"><div class="panel secondary-metric"><span>VaR diário 95%</span><strong id="var-95">—</strong></div></div>
+          <div class="col-sm-6 col-lg-3"><div class="panel secondary-metric"><span>Pior dia</span><strong id="worst-day">—</strong></div></div>
+        </section>
         <div class="panel chart-panel mb-4"><div class="chart-heading"><h2>Evolução do portfólio</h2><span>Wealth Index · alocação selecionada</span></div><div id="wealth-chart" class="chart"></div></div>
         <div class="row g-4">
           <div class="col-lg-6"><div class="panel chart-panel h-100"><div class="chart-heading"><h2>Pesos da carteira</h2><span id="allocation-method">Método selecionado</span></div><div id="weights-chart" class="chart"></div></div></div>
           <div class="col-lg-6"><div class="panel chart-panel h-100"><div class="chart-heading"><h2>Distribuição de perdas</h2><span>ES histórico 99%: <strong id="es-value">—</strong></span></div><div id="loss-chart" class="chart"></div></div></div>
+        </div>
+        <div class="row g-4 mt-0">
+          <div class="col-lg-6"><div class="panel chart-panel h-100"><div class="chart-heading"><h2>Drawdown histórico</h2><span>Queda desde o pico anterior</span></div><div id="drawdown-chart" class="chart"></div></div></div>
+          <div class="col-lg-6"><div class="panel chart-panel h-100"><div class="chart-heading"><h2>Volatilidade móvel</h2><span>21 pregões · anualizada</span></div><div id="rolling-vol-chart" class="chart"></div></div></div>
+          <div class="col-lg-6"><div class="panel chart-panel h-100"><div class="chart-heading"><h2>Correlação dos ativos</h2><span>Retornos diários</span></div><div id="correlation-chart" class="chart"></div></div></div>
+          <div class="col-lg-6"><div class="panel chart-panel h-100"><div class="chart-heading"><h2>Contribuição para o risco</h2><span>Volatilidade anualizada por ativo</span></div><div id="contribution-chart" class="chart"></div></div></div>
         </div>
         <p class="footnote mt-3">Retornos de preços ajustados; VaR e ES históricos a 99%. Feriados distintos são alinhados pelo último fechamento disponível. Carteiras mistas B3/EUA usam USD como moeda base, convertendo os preços da B3 por USDBRL.</p>
       </main>
