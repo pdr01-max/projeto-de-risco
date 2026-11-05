@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: quant-risk-engine
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    envVars:
+      - key: PORT
+        value: "10000"
