@@ -1,10 +1,10 @@
 /* API calls use relative paths so the dashboard works on any deployment host. */
 const $ = (id) => document.getElementById(id);
 const pct = (value) => `${(100 * value).toFixed(2)}%`;
-const chartColors = { background: '#111d2d', text: '#91a7bd', grid: '#26394e', cyan: '#36c8f4', purple: '#a78bfa' };
+const chartColors = { text: '#a4b0b4', grid: '#394349', amber: '#e9ad45', steel: '#7fa7c2', red: '#f17e75' };
 const layout = (extra = {}) => ({
   paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)',
-  font: { color: chartColors.text, family: 'Segoe UI, Arial' },
+  font: { color: chartColors.text, family: 'IBM Plex Sans, Segoe UI, Arial' },
   margin: { l: 52, r: 18, t: 24, b: 44 }, autosize: true,
   xaxis: { gridcolor: chartColors.grid, zerolinecolor: chartColors.grid },
   yaxis: { gridcolor: chartColors.grid, zerolinecolor: chartColors.grid },
@@ -44,16 +44,16 @@ function renderRisk(data) {
   setAlert('dd', data.metrics.max_drawdown, data.limits.max_drawdown);
   $('es-value').textContent = pct(data.metrics.es_99);
   Plotly.react('wealth-chart', [{ x: data.dates, y: data.wealth_index, type: 'scatter',
-    mode: 'lines', line: { color: chartColors.cyan, width: 2.5 },
-    fill: 'tozeroy', fillcolor: 'rgba(54,200,244,.09)', hovertemplate: '%{x}<br>Índice: %{y:.3f}<extra></extra>'
+    mode: 'lines', line: { color: chartColors.amber, width: 2.5 },
+    fill: 'tozeroy', fillcolor: 'rgba(233,173,69,.10)', hovertemplate: '%{x}<br>Índice: %{y:.3f}<extra></extra>'
   }], layout({ yaxis: { gridcolor: chartColors.grid, title: 'Base 1,0' } }), config);
   Plotly.react('loss-chart', [{ x: data.daily_losses.map(x => x * 100), type: 'histogram',
-    marker: { color: '#587ba6', line: { color: '#87a9ce', width: .4 } }, nbinsx: 45,
+    marker: { color: '#5b7990', line: { color: chartColors.steel, width: .4 } }, nbinsx: 45,
     hovertemplate: 'Perda: %{x:.2f}%<br>Dias: %{y}<extra></extra>'
   }], layout({ xaxis: { title: 'Perda diária (%)', gridcolor: chartColors.grid },
     yaxis: { title: 'Frequência', gridcolor: chartColors.grid },
     shapes: [{ type: 'line', x0: data.metrics.var_99 * 100, x1: data.metrics.var_99 * 100,
-      y0: 0, y1: 1, yref: 'paper', line: { color: '#ff6875', width: 2, dash: 'dash' } }]
+      y0: 0, y1: 1, yref: 'paper', line: { color: chartColors.red, width: 2, dash: 'dash' } }]
   }), config);
 }
 
@@ -61,7 +61,7 @@ function renderWeights(data) {
   const names = data.tickers;
   $('allocation-method').textContent = $('method').selectedOptions[0].textContent;
   Plotly.react('weights-chart', [
-    { x: names, y: names.map(x => data.weights[x] * 100), type: 'bar', name: 'Peso', marker: { color: chartColors.cyan } }
+    { x: names, y: names.map(x => data.weights[x] * 100), type: 'bar', name: 'Peso', marker: { color: chartColors.steel } }
   ], layout({ yaxis: { title: 'Peso (%)', gridcolor: chartColors.grid } }), config);
 }
 
@@ -91,7 +91,7 @@ function refreshWeights() {
 function updateTotal() {
   const total = [...document.querySelectorAll('.weight-input')].reduce((s, x) => s + Number(x.value), 0);
   $('weight-total').textContent = `Total: ${total.toFixed(2)}%`;
-  $('weight-total').style.color = Math.abs(total - 100) < .01 ? '#30d196' : '#ff6875';
+  $('weight-total').style.color = Math.abs(total - 100) < .01 ? '#77c99a' : '#f17e75';
 }
 function toggleMethod() { $('manual-weights').hidden = $('method').value !== 'manual'; $('weight-total').hidden = $('method').value !== 'manual'; }
 let tickerTimer;
