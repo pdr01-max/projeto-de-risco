@@ -31,7 +31,7 @@ METHODS = {"manual", "max_sharpe", "min_cvar", "risk_parity", "hrp"}
 VAR_MODELS = {"historical", "normal", "ewma", "garch", "monte_carlo"}
 BENCHMARKS = {"none", "^BVSP", "^GSPC"}
 STRESS_WINDOWS = {"Covid (fev–mar/2020)": ("2020-02-19", "2020-03-24"),
-                  "Juros globais (2022)": ("2022-01-03", "2022-10-21")}
+                  "Crise financeira (2008)": ("2008-09-12", "2008-11-22")}
 app = FastAPI(title="Quant Risk Engine", version="2.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
