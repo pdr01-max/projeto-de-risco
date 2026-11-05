@@ -11,7 +11,7 @@ def prices(monkeypatch):
     prices = pd.DataFrame(100*np.cumprod(1+returns, axis=0),
                           index=pd.date_range("2025-01-01", periods=250, freq="B"),
                           columns=["AAPL", "PETR4.SA"])
-    monkeypatch.setattr(api_app, "_download_cached", lambda tickers, period, bucket: prices)
+    monkeypatch.setattr(api_app, "_download_cached", lambda tickers, period, bucket, start=None, end=None: prices)
     return prices
 
 
@@ -35,3 +35,17 @@ def test_invalid_weights_and_static_route(prices):
         api_app.PortfolioRequest(tickers=["AAPL", "PETR4.SA"], weights=[.4, .4])
     assert str(api_app.index().path).endswith("index.html")
     assert api_app.health() == {"status": "ok"}
+
+
+def test_rebalance_respects_all_limits():
+    rng = np.random.default_rng(31)
+    portfolio = rng.normal(.0003, .025, 500)
+    weights = pd.Series({"AAPL": .7, "SPY": .3})
+    limits = {"var_99": .015, "es_99": .025,
+              "volatility_annual": .12, "max_drawdown": .08}
+    result = api_app._risk_budget(portfolio, weights, limits)
+    assert result["breaches"]
+    assert result["compliant"]
+    assert np.isclose(sum(result["recommended_weights"].values()), 1)
+    assert all(result["recommended_metrics"][key] <= limit + 1e-8
+               for key, limit in limits.items())
