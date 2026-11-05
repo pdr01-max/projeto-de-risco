@@ -1,6 +1,8 @@
 /* API calls use relative paths so the dashboard works on any deployment host. */
 const $ = (id) => document.getElementById(id);
 const pct = (value) => `${(100 * value).toFixed(2)}%`;
+const money = (value, currency) => new Intl.NumberFormat('pt-BR', { style: 'currency', currency }).format(value);
+const ratio = value => value === null || !Number.isFinite(value) ? '—' : value.toFixed(2);
 const chartColors = { text: '#a4b0b4', grid: '#394349', amber: '#e9ad45', steel: '#7fa7c2', red: '#f17e75' };
 const layout = (extra = {}) => ({
   paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)',
@@ -47,6 +49,25 @@ function renderRisk(data) {
   $('downside-vol').textContent = pct(data.metrics.downside_volatility_annual);
   $('var-95').textContent = pct(data.metrics.var_95);
   $('worst-day').textContent = pct(data.metrics.worst_day);
+  $('money-var').textContent = money(Math.max(0, data.metrics.var_99) * data.capital, data.base_currency);
+  $('money-es').textContent = money(Math.max(0, data.metrics.es_99) * data.capital, data.base_currency);
+  $('money-var-95').textContent = money(Math.max(0, data.metrics.var_95) * data.capital, data.base_currency);
+  $('money-worst-day').textContent = money(Math.max(0, -data.metrics.worst_day) * data.capital, data.base_currency);
+  ['sharpe', 'sortino', 'calmar'].forEach(id => { $(id).textContent = ratio(data.metrics[id]); });
+  const kupiec = data.backtest;
+  $('kupiec-status').textContent = kupiec.status;
+  $('kupiec-status').className = kupiec.status === 'Aprovado' ? 'result-approved' : kupiec.status === 'Atenção' ? 'result-warning' : 'result-rejected';
+  $('kupiec-details').textContent = `${kupiec.breaches} violações em ${kupiec.observations} observações fora da amostra · esperado: ${kupiec.expected.toFixed(1)} · p-valor: ${kupiec.p_value.toFixed(4)}. Previsões calculadas apenas com dados anteriores a cada dia.`;
+  const stressBody = $('stress-results');
+  stressBody.replaceChildren();
+  data.stress_tests.forEach(item => {
+    const row = document.createElement('tr');
+    [item.scenario, `${item.start} a ${item.end}`, item.available ? pct(item.return) : 'Histórico indisponível',
+      item.available ? money(item.pnl, data.base_currency) : '—'].forEach(value => {
+      const cell = document.createElement('td'); cell.textContent = value; row.append(cell);
+    });
+    stressBody.append(row);
+  });
   renderRiskBudget(data);
   const purchasePanel = $('purchase-panel');
   purchasePanel.hidden = !data.purchase_analysis?.length;
@@ -54,9 +75,9 @@ function renderRisk(data) {
   purchaseBody.replaceChildren();
   (data.purchase_analysis || []).forEach(item => {
     const row = document.createElement('tr');
-    const money = value => new Intl.NumberFormat('pt-BR', { style: 'currency', currency: item.currency }).format(value);
-    [item.ticker, item.date, item.holding_days, item.quantity, money(item.purchase_price), money(item.current_price),
-      money(item.cost), money(item.market_value), money(item.pnl), pct(item.return),
+    const localMoney = value => money(value, item.currency);
+    [item.ticker, item.date, item.holding_days, item.quantity, item.split_factor.toFixed(4), item.adjusted_quantity,
+      localMoney(item.purchase_price), localMoney(item.current_price), localMoney(item.cost), localMoney(item.market_value), localMoney(item.pnl), pct(item.return),
       item.return_annualized === null ? '—' : pct(item.return_annualized)].forEach(value => {
       const cell = document.createElement('td');
       cell.textContent = value;
@@ -84,10 +105,18 @@ function renderRisk(data) {
     type: 'bar', marker: { color: chartColors.steel },
     hovertemplate: '%{x}<br>Contribuição: %{y:.2f} p.p.<extra></extra>'
   }], layout({ yaxis: { title: 'Pontos percentuais', gridcolor: chartColors.grid } }), config);
-  Plotly.react('wealth-chart', [{ x: data.dates, y: data.wealth_index, type: 'scatter',
+  const wealthTraces = [{ x: data.dates, y: data.wealth_index, type: 'scatter', name: 'Carteira',
     mode: 'lines', line: { color: chartColors.amber, width: 2.5 },
     fill: 'tozeroy', fillcolor: 'rgba(233,173,69,.10)', hovertemplate: '%{x}<br>Índice: %{y:.3f}<extra></extra>'
-  }], layout({ yaxis: { gridcolor: chartColors.grid, title: 'Base 1,0' } }), config);
+  }];
+  if (data.benchmark) wealthTraces.push({ x: data.benchmark.dates, y: data.benchmark.wealth_index,
+    type: 'scatter', mode: 'lines', name: data.benchmark.symbol,
+    line: { color: chartColors.steel, width: 2, dash: 'dot' },
+    hovertemplate: '%{x}<br>Benchmark: %{y:.3f}<extra></extra>' });
+  if (kupiec.breach_dates.length) wealthTraces.push({ x: kupiec.breach_dates, y: kupiec.breach_wealth,
+    type: 'scatter', mode: 'markers', name: 'Violação VaR', marker: { color: chartColors.red, size: 8, symbol: 'x' },
+    hovertemplate: '%{x}<br>Violação VaR<extra></extra>' });
+  Plotly.react('wealth-chart', wealthTraces, layout({ yaxis: { gridcolor: chartColors.grid, title: 'Base 1,0' } }), config);
   Plotly.react('loss-chart', [{ x: data.daily_losses.map(x => x * 100), type: 'histogram',
     marker: { color: '#5b7990', line: { color: chartColors.steel, width: .4 } }, nbinsx: 45,
     hovertemplate: 'Perda: %{x:.2f}%<br>Dias: %{y}<extra></extra>'
@@ -209,18 +238,63 @@ function updateTotal() {
   $('weight-total').style.color = Math.abs(total - 100) < .01 ? '#77c99a' : '#f17e75';
 }
 function toggleMethod() { $('manual-weights').hidden = $('method').value !== 'manual'; $('weight-total').hidden = $('method').value !== 'manual'; }
+const shareKeys = ['tickers', 'period', 'method', 'base-currency', 'capital', 'var-model', 'benchmark',
+  'var-limit', 'es-limit', 'vol-limit', 'dd-limit'];
+function shareURL() {
+  const params = new URLSearchParams();
+  shareKeys.forEach(id => params.set(id, $(id).value));
+  if ($('period').value === 'custom') { params.set('start-date', $('start-date').value); params.set('end-date', $('end-date').value); }
+  if ($('method').value === 'manual') params.set('weights', [...document.querySelectorAll('.weight-input')].map(x => x.value).join(','));
+  return `${location.origin}${location.pathname}?${params.toString()}`;
+}
+function syncURL() { history.replaceState(null, '', shareURL()); }
+function restoreURL() {
+  const params = new URLSearchParams(location.search);
+  if (!params.size) {
+    $('tickers').value = 'PETR4.SA, VALE3.SA, ITUB4.SA, AAPL, SPY, TLT';
+    $('method').value = 'risk_parity';
+  } else {
+    shareKeys.forEach(id => { if (params.has(id)) $(id).value = params.get(id); });
+    $('start-date').value = params.get('start-date') || '';
+    $('end-date').value = params.get('end-date') || '';
+  }
+  refreshWeights(); toggleMethod();
+  $('custom-dates').hidden = $('period').value !== 'custom';
+  if (params.has('weights') && $('method').value === 'manual') {
+    params.get('weights').split(',').forEach((weight, i) => {
+      const input = document.querySelectorAll('.weight-input')[i];
+      if (input) input.value = weight;
+    });
+    updateTotal();
+  }
+}
 let tickerTimer;
-$('tickers').addEventListener('input', () => { clearTimeout(tickerTimer); tickerTimer = setTimeout(refreshWeights, 250); });
-$('method').addEventListener('change', toggleMethod);
-$('period').addEventListener('change', () => { $('custom-dates').hidden = $('period').value !== 'custom'; });
-document.querySelectorAll('.preset').forEach(button => button.addEventListener('click', () => { $('tickers').value = button.dataset.tickers; refreshWeights(); }));
-refreshWeights(); toggleMethod();
+$('tickers').addEventListener('input', () => { clearTimeout(tickerTimer); tickerTimer = setTimeout(() => { refreshWeights(); syncURL(); }, 250); });
+$('method').addEventListener('change', () => { toggleMethod(); syncURL(); });
+$('period').addEventListener('change', () => { $('custom-dates').hidden = $('period').value !== 'custom'; syncURL(); });
+document.querySelectorAll('.preset').forEach(button => button.addEventListener('click', () => { $('tickers').value = button.dataset.tickers; refreshWeights(); syncURL(); }));
+$('risk-form').addEventListener('change', syncURL);
+$('risk-form').addEventListener('input', event => { if (event.target.id !== 'tickers') syncURL(); });
+$('copy-link').addEventListener('click', async () => {
+  try {
+    const url = shareURL();
+    await navigator.clipboard.writeText(url);
+    $('copy-link').textContent = 'Link copiado!';
+    setTimeout(() => { $('copy-link').textContent = 'Copiar link da carteira'; }, 2500);
+  } catch { $('copy-link').textContent = 'Não foi possível copiar'; }
+});
+restoreURL();
+window.addEventListener('popstate', () => { restoreURL(); $('risk-form').requestSubmit(); });
 
 $('risk-form').addEventListener('submit', async (event) => {
   event.preventDefault();
   const tickers = tickerList();
   const payload = { tickers, period: $('period').value,
     method: $('method').value,
+    base_currency: $('base-currency').value,
+    capital: Number($('capital').value),
+    var_model: $('var-model').value,
+    benchmark: $('benchmark').value,
     var_limit: Number($('var-limit').value) / 100,
     es_limit: Number($('es-limit').value) / 100,
     volatility_limit: Number($('vol-limit').value) / 100,
@@ -242,6 +316,9 @@ $('risk-form').addEventListener('submit', async (event) => {
   });
   const button = $('run-button');
   button.disabled = true;
+  $('run-spinner').hidden = false;
+  $('run-label').textContent = 'Calculando…';
+  $('results-main').classList.add('loading-results');
   $('status').classList.remove('error');
   $('status').textContent = 'Baixando preços e calculando riscos…';
   try {
@@ -249,7 +326,7 @@ $('risk-form').addEventListener('submit', async (event) => {
     if (payload.period === 'custom' && (!payload.start_date || !payload.end_date || payload.start_date >= payload.end_date)) {
       throw new Error('Informe um intervalo histórico válido.');
     }
-    if (!tickers.length || !payload.var_limit || !payload.es_limit || !payload.volatility_limit || !payload.drawdown_limit) {
+    if (!tickers.length || !payload.var_limit || !payload.es_limit || !payload.volatility_limit || !payload.drawdown_limit || !Number.isFinite(payload.capital) || payload.capital <= 0) {
       throw new Error('Informe tickers e limites positivos.');
     }
     if (payload.method === 'manual') {
@@ -262,8 +339,10 @@ $('risk-form').addEventListener('submit', async (event) => {
     renderRisk(risk);
     renderWeights(risk);
     $('status').textContent = `${risk.observations} pregões analisados · ${tickers.length} ativo(s).`;
+    syncURL();
   } catch (error) {
     $('status').classList.add('error');
     $('status').textContent = `Não foi possível concluir: ${error.message}`;
-  } finally { button.disabled = false; }
+  } finally { button.disabled = false; $('run-spinner').hidden = true; $('run-label').textContent = 'Calcular risco e otimizar'; $('results-main').classList.remove('loading-results'); }
 });
+$('risk-form').requestSubmit();

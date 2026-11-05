@@ -112,6 +112,7 @@ h1 { font-size: clamp(1.7rem, 3vw, 2.55rem); font-weight: 650; letter-spacing: -
 .metric { min-height: 148px; padding: 1.2rem 1.3rem; border-top: 3px solid #64737b; }
 .metric-label { color: var(--muted); font-family: "IBM Plex Mono", Consolas, monospace; font-size: .72rem; letter-spacing: .04em; text-transform: uppercase; }
 .metric-value { margin: .28rem 0; font-family: "IBM Plex Mono", Consolas, monospace; font-size: 2rem; font-weight: 600; letter-spacing: -.05em; }
+.metric-money { color: var(--accent-soft); font-family: "IBM Plex Mono", Consolas, monospace; font-size: 1rem; }
 .metric-limit { color: var(--muted); font-size: .75rem; }
 .traffic { margin-top: .5rem; font-size: .75rem; font-weight: 700; }
 .metric.green { border-top-color: var(--green); }
@@ -130,6 +131,12 @@ h1 { font-size: clamp(1.7rem, 3vw, 2.55rem); font-weight: 650; letter-spacing: -
 .secondary-metric { padding: 1rem 1.2rem; display: flex; flex-direction: column; gap: .45rem; }
 .secondary-metric span { color: var(--muted); font-family: "IBM Plex Mono", Consolas, monospace; font-size: .7rem; text-transform: uppercase; }
 .secondary-metric strong { font-family: "IBM Plex Mono", Consolas, monospace; font-size: 1.25rem; font-weight: 600; }
+.secondary-metric small { color: var(--accent-soft); font-family: "IBM Plex Mono", Consolas, monospace; }
+.loading-results { opacity: .48; transition: opacity .2s ease; pointer-events: none; }
+.result-approved { color: var(--green); font-weight: 700; }
+.result-warning { color: var(--yellow); font-weight: 700; }
+.result-rejected { color: var(--red); font-weight: 700; }
+[hidden] { display: none !important; }
 .purchase-input { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: .4rem; margin-bottom: .85rem; }
 .purchase-input .ticker-name { grid-column: 1 / -1; color: var(--accent); font-family: "IBM Plex Mono", Consolas, monospace; font-size: .75rem; }
 .purchase-input .form-control { min-width: 0; font-size: .78rem; }
