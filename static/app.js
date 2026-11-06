@@ -14,6 +14,107 @@ const layout = (extra = {}) => ({
 });
 const config = { responsive: true, displaylogo: false };
 
+const allocationHelp = {
+  manual: 'Você define os pesos e controla cada posição. Vantagem: respeita decisões próprias; limite: depende da sua análise e os pesos devem somar 100%.',
+  equal: 'Distribui 1/N do capital em cada ativo, sem estimar retornos ou correlações. Vantagem: simples e transparente; limite: ativos mais voláteis podem dominar o risco.',
+  max_sharpe: 'Markowitz busca a melhor relação entre retorno esperado e volatilidade pela média e covariância estimadas. Vantagem: eficiente sob essas estimativas; limite: pesos sensíveis a erros nas médias.',
+  min_cvar: 'Minimiza a perda média nos piores cenários históricos (CVaR). Vantagem: foca na cauda; limite: depende dos eventos presentes na amostra.',
+  risk_parity: 'Equal Risk Contribution ajusta pesos para aproximar a contribuição de risco de cada ativo. Vantagem: reduz concentração de risco; limite: não otimiza retorno esperado.',
+  hrp: 'Hierarchical Risk Parity agrupa ativos pela correlação e distribui risco pela árvore de clusters. Vantagem: tende a ser mais estável; limite: depende da janela e do agrupamento.'
+};
+const modelHelp = {
+  historical: 'Usa a distribuição empírica das perdas passadas, sem curva teórica. Vantagem: transparente; limite: reage devagar a mudanças bruscas e não extrapola além do histórico.',
+  normal: 'Estima média e matriz de covariância e supõe retornos gaussianos. Vantagem: rápido; limite: pode subestimar caudas gordas e choques extremos.',
+  ewma: 'EWMA dá mais peso às observações recentes para prever a volatilidade condicional. Vantagem: reage à turbulência; limite: depende do fator de decaimento e da forma da cauda.',
+  garch: 'GARCH Student-t prevê a volatilidade condicional e usa inovações com caudas mais pesadas. Vantagem: captura clusterização; limite: requer ajuste estável dos parâmetros.',
+  monte_carlo: 'Simula cenários correlacionados com média e covariância estimadas. Vantagem: gera muitos cenários coerentes; limite: a hipótese de distribuição usada pode perder choques extremos.',
+  evt: 'EVT-POT ajusta uma GPD às perdas acima do limiar u. Vantagem: extrapola a cauda; limite: poucos excessos tornam a estimativa sensível ao limiar.',
+  filtered_ewma_evt: 'Filtra retornos pela volatilidade EWMA e ajusta GPD aos resíduos extremos. Vantagem: separa regime de volatilidade e cauda; limite: sensível ao filtro e ao número de excessos.',
+  filtered_garch_evt: 'Filtra retornos por GARCH e ajusta GPD aos resíduos acima de u. Vantagem: combina clusterização e caudas gordas; limite: ajuste mais complexo e instável com amostra curta.',
+  copula_evt: 'Ajusta GPD às caudas de cada ativo e cópula Student-t à dependência conjunta. Vantagem: contempla perdas extremas simultâneas; limite: depende da calibração das marginais e da cópula.'
+};
+const helpContent = [
+  ['#card-var', 'VaR diário', 'É o limiar de perda diária que o modelo espera ultrapassar em apenas 1 − confiança dos dias. Compare com o seu limite; não representa a pior perda possível.'],
+  ['#card-es', 'Expected Shortfall', 'É a perda média estimada quando o VaR é ultrapassado. Na prática, mede a gravidade dos dias que já estão na cauda.'],
+  ['#card-vol', 'Volatilidade anual', 'É o desvio padrão dos retornos diários multiplicado pela raiz de 252. Mede oscilação para cima e para baixo; compare com o teto anual.'],
+  ['#card-dd', 'Max Drawdown', 'É a maior queda percentual acumulada entre um topo histórico e o fundo seguinte, antes de uma nova máxima. Indica a perda de trajetória que um investidor teria suportado.'],
+  ['#rebalance-panel', 'Limites e rebalanceamento', 'Mostra quais limites a alocação violou e a mistura sugerida de ativos e caixa para respeitá-los. O cenário é uma simulação, não uma ordem de negociação.'],
+  ['#return-annual', 'Retorno anualizado', 'Transforma o crescimento observado da carteira em uma taxa composta equivalente a 252 pregões. Útil para comparar períodos; não é promessa de retorno.'],
+  ['#downside-vol', 'Volatilidade de queda', 'Mede a dispersão apenas dos retornos abaixo de zero. Destaca oscilações desfavoráveis que a volatilidade total mistura com altas.'],
+  ['#var-95', 'VaR diário 95%', 'Limiar de perda diária excedido em cerca de 5% dos dias sob o modelo. É menos extremo que o VaR principal selecionado.'],
+  ['#worst-day', 'Pior dia histórico', 'Maior perda diária observada na janela da carteira. Serve como referência concreta; eventos futuros podem ser piores.'],
+  ['#sharpe', 'Índice de Sharpe', 'Retorno excedente à taxa livre de risco dividido pela volatilidade total. Quanto maior, melhor a compensação por unidade de oscilação, se a taxa e a janela forem comparáveis.'],
+  ['#sortino', 'Índice de Sortino', 'Retorno excedente à taxa livre de risco dividido pela volatilidade abaixo dessa taxa. Quanto maior, melhor a compensação pelo risco de queda.'],
+  ['#calmar', 'Índice de Calmar', 'Retorno anualizado dividido pelo Max Drawdown histórico. Quanto maior, melhor o retorno em relação à pior perda de trajetória.'],
+  ['#wealth-chart', 'Evolução do portfólio', 'Wealth Index é o valor acumulado de 1 unidade investida nos pesos escolhidos. Compare a trajetória com o benchmark convertido para a mesma moeda.'],
+  ['#weights-chart', 'Pesos da carteira', 'Mostra a fração do capital alocada em cada ativo. Pesos elevados concentram exposição, mas contribuição ao risco também depende de volatilidade e correlação.'],
+  ['#loss-chart', 'Distribuição de perdas', 'Histograma das perdas diárias observadas. A linha do VaR marca o limiar estimado; os dias além dela compõem a cauda relevante para o ES.'],
+  ['#drawdown-chart', 'Drawdown histórico', 'Mostra a queda percentual acumulada desde a máxima anterior em cada data. Zero indica novo topo; valores mais negativos indicam recuperação ainda pendente.'],
+  ['#rolling-vol-chart', 'Volatilidade móvel', 'Volatilidade anualizada estimada nos últimos 21 pregões de cada ponto. Subidas indicam que o risco recente aumentou.'],
+  ['#correlation-chart', 'Correlação dos ativos', 'Mostra como os retornos diários dos ativos se moveram juntos na janela. Próximo de +1 indica movimentos semelhantes; correlações podem subir em crises.'],
+  ['#contribution-chart', 'Contribuição para o risco', 'Decomposição de Euler: wᵢ(Σw)ᵢ/σ²ₚ. As parcelas somam 100% e revelam quais posições explicam a volatilidade da carteira.'],
+  ['#kupiec-status', 'Backtest Kupiec + Christoffersen', 'Compara violações reais com a frequência esperada (Kupiec) e testa agrupamento temporal e cobertura conjunta (Christoffersen). p-valores baixos sugerem inadequação do modelo.'],
+  ['#stress-results', 'Stress test histórico', 'Reaplica os pesos atuais a janelas de crise observadas. Se um ativo não existia na época, o painel sinaliza histórico parcial ou indisponível.'],
+  ['#tail-diagnostic', 'Diagnóstico EVT', 'u é o limiar; Nu é o número de perdas acima dele. ξ mede o peso da cauda e β sua escala na GPD; o p-valor KS é uma verificação aproximada de aderência, não garantia de previsão.'],
+  ['#liquidity-results', 'Liquidez / LVaR', 'Acrescenta ao VaR o custo estimado de execução e o horizonte para liquidar a posição usando até 10% do volume médio diário (ADV). Slippage eleva o custo em mercados tensos.'],
+  ['#election-results', 'Stress político', 'Projeta o efeito de choques de Ibovespa, S&P 500 e câmbio usando sensibilidades estimadas, com contágio e volatilidade ajustáveis. É cenário hipotético, não previsão.'],
+  ['#purchase-panel', 'Resultado desde a compra', 'Compara custo de aquisição com valor atual, ajustando quantidade por splits e somando proventos recebidos. PnL usa a moeda base; não inclui impostos ou taxas.']
+];
+
+function initHelp() {
+  const popover = document.createElement('div');
+  popover.className = 'help-popover'; popover.id = 'help-popover'; popover.setAttribute('role', 'tooltip');
+  document.body.append(popover);
+  let active = null;
+  const hide = () => { popover.hidden = true; active = null; };
+  const show = (button, heading, description) => {
+    active = button;
+    popover.replaceChildren();
+    const title = document.createElement('strong'); title.textContent = heading;
+    const body = document.createElement('span'); body.textContent = description;
+    popover.append(title, body); popover.hidden = false;
+    const rect = button.getBoundingClientRect();
+    const width = Math.min(340, innerWidth - 24);
+    popover.style.width = `${width}px`;
+    const left = Math.max(12, Math.min(rect.right - width, innerWidth - width - 12));
+    const height = popover.getBoundingClientRect().height;
+    const below = rect.bottom + 10 + height <= innerHeight - 12;
+    popover.style.left = `${left}px`;
+    popover.style.top = `${below ? rect.bottom + 10 : Math.max(12, rect.top - height - 10)}px`;
+  };
+  const add = (anchor, heading, description, inline = false) => {
+    if (!anchor) return;
+    const button = document.createElement('button');
+    button.type = 'button'; button.className = `help-trigger${inline ? ' help-inline' : ''}`;
+    button.textContent = '!'; button.setAttribute('aria-label', `Ajuda: ${heading}`);
+    button.setAttribute('aria-describedby', popover.id); button.tabIndex = 0;
+    if (inline) anchor.insertAdjacentElement('afterend', button);
+    else { anchor.classList.add('has-help'); anchor.append(button); }
+    button.addEventListener('pointerenter', () => show(button, heading, description));
+    button.addEventListener('pointerleave', () => { if (document.activeElement !== button) hide(); });
+    button.addEventListener('focus', () => show(button, heading, description));
+    button.addEventListener('blur', hide);
+    button.addEventListener('click', () => show(button, heading, description));
+  };
+  helpContent.forEach(([selector, heading, description]) => {
+    const node = document.querySelector(selector);
+    add(node?.closest('.panel'), heading, description);
+  });
+  add(document.querySelector('label[for="method"]'), 'Métodos de alocação', 'Pesos manuais: decisão própria; pesos iguais (1/N): referência simples; Markowitz: retorno por risco; Min-CVaR: perdas de cauda; Risk Parity: contribuição de risco igual; HRP: clusters de correlação. O resumo abaixo acompanha a seleção.', true);
+  add(document.querySelector('label[for="var-model"]'), 'Modelos de VaR e ES', 'Histórico: perdas observadas; Normal: curva gaussiana; EWMA/GARCH: volatilidade dinâmica; Monte Carlo: cenários correlacionados; EVT-POT: GPD acima do limiar u; cópula Student-t: dependência de perdas conjuntas. O resumo abaixo acompanha a seleção.', true);
+  add(document.querySelector('label[for="stress-preset"]'), 'Cenário hipotético', 'Nenhum desliga os choques artificiais. Escolha um preset para aplicar seus parâmetros ou Personalizado para editar cada choque.', true);
+  document.addEventListener('keydown', event => { if (event.key === 'Escape') hide(); });
+  document.addEventListener('pointerdown', event => { if (!event.target.closest('.help-trigger')) hide(); });
+  window.addEventListener('scroll', hide, true);
+  window.addEventListener('resize', hide);
+  hide();
+}
+
+function updateSelectionHelp() {
+  $('method-summary').textContent = allocationHelp[$('method').value];
+  $('model-summary').textContent = modelHelp[$('var-model').value];
+}
+
 function setAlert(id, measured, limit) {
   const card = $(`card-${id}`);
   const ratio = measured / limit;
@@ -69,7 +170,10 @@ function renderRisk(data) {
   const liq = data.liquidity;
   $('liquidity-results').textContent = liq ? `LVaR ${pct(liq.lvar)} (${money(liq.lvar * data.capital, data.base_currency)}); ES ajustado ${pct(liq.les)}. Liquidação estimada: ${liq.days} dia(s) úteis a até 10% do ADV; custo estimado ${money(liq.execution_cost, data.base_currency)}.` : 'Ative a opção de liquidez.';
   const event = data.election_stress;
-  $('election-results').textContent = event?.available === false ? 'Sensibilidades indisponíveis para esta janela.' : `Impacto estimado: ${pct(event.return)} (${money(event.pnl, data.base_currency)}). Choques de fatores e contágio conforme os campos selecionados.`;
+  $('election-results').textContent = event?.reason === 'none'
+    ? 'Nenhum cenário hipotético selecionado — selecione um preset ou preencha choques personalizados para simular.'
+    : event?.available === false ? 'Sensibilidades indisponíveis para esta janela.'
+    : `Impacto estimado: ${pct(event.return)} (${money(event.pnl, data.base_currency)}). Choques de fatores e contágio conforme os campos selecionados.`;
   const stressBody = $('stress-results');
   stressBody.replaceChildren();
   data.stress_tests.forEach(item => {
@@ -288,14 +392,28 @@ function restoreURL() {
     });
     updateTotal();
   }
+  applyStressPreset(false);
+  updateSelectionHelp();
 }
 let tickerTimer;
 $('tickers').addEventListener('input', () => { clearTimeout(tickerTimer); tickerTimer = setTimeout(() => { refreshWeights(); syncURL(); }, 250); });
-$('method').addEventListener('change', () => { toggleMethod(); syncURL(); });
+$('method').addEventListener('change', () => { toggleMethod(); updateSelectionHelp(); syncURL(); });
+$('var-model').addEventListener('change', () => { updateSelectionHelp(); syncURL(); });
 $('period').addEventListener('change', () => { $('custom-dates').hidden = $('period').value !== 'custom'; syncURL(); });
 $('base-currency').addEventListener('change', () => { $('risk-free').value = $('base-currency').value === 'BRL' ? '11.25' : '4.50'; syncURL(); });
 const stressPresets = { election: [-20,-5,15,3,.8,3], fx: [-10,-3,25,2,.6,4], global: [-15,-25,10,3,.9,3] };
-$('stress-preset').addEventListener('change', () => { const values = stressPresets[$('stress-preset').value]; if (values) ['stress-ibov','stress-sp500','stress-fx','stress-vol','stress-contagion','stress-slippage'].forEach((id,i) => { $(id).value = values[i]; }); syncURL(); });
+const stressFields = ['stress-ibov','stress-sp500','stress-fx','stress-vol','stress-contagion','stress-slippage'];
+function applyStressPreset(changed = true) {
+  const preset = $('stress-preset').value;
+  const values = preset === 'none' ? [0,0,0,1,0,1] : changed ? stressPresets[preset] : null;
+  if (values) stressFields.forEach((id,i) => { $(id).value = values[i]; });
+  stressFields.forEach(id => { $(id).disabled = preset === 'none'; });
+}
+$('stress-preset').addEventListener('change', () => { applyStressPreset(); syncURL(); });
+stressFields.forEach(id => $(id).addEventListener('input', () => {
+  if ($('stress-preset').value !== 'custom') $('stress-preset').value = 'custom';
+  syncURL();
+}));
 document.querySelectorAll('.preset').forEach(button => button.addEventListener('click', () => { $('tickers').value = button.dataset.tickers; refreshWeights(); syncURL(); }));
 $('risk-form').addEventListener('change', syncURL);
 $('risk-form').addEventListener('input', event => { if (event.target.id !== 'tickers') syncURL(); });
@@ -320,6 +438,7 @@ $('risk-form').addEventListener('submit', async (event) => {
     var_model: $('var-model').value,
     confidence: Number($('confidence').value), threshold_quantile: Number($('threshold-quantile').value),
     risk_free_annual: Number($('risk-free').value)/100, liquidity: $('liquidity').checked,
+    stress_preset: $('stress-preset').value,
     stress_ibov: Number($('stress-ibov').value)/100, stress_sp500: Number($('stress-sp500').value)/100,
     stress_fx: Number($('stress-fx').value)/100, stress_vol_multiplier: Number($('stress-vol').value),
     stress_contagion: Number($('stress-contagion').value), stress_slippage_multiplier: Number($('stress-slippage').value),
@@ -374,4 +493,5 @@ $('risk-form').addEventListener('submit', async (event) => {
     $('status').textContent = `Não foi possível concluir: ${error.message}`;
   } finally { button.disabled = false; $('run-spinner').hidden = true; $('run-label').textContent = 'Calcular risco e otimizar'; $('results-main').classList.remove('loading-results'); }
 });
+initHelp();
 $('risk-form').requestSubmit();
