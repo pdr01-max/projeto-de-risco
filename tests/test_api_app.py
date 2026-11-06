@@ -240,3 +240,14 @@ def test_evt_api_json_and_limit_alignment(prices):
     assert result["risk_budget"]["model"] == "evt"
     assert np.isclose(result["metrics"]["var_99"],
                       result["risk_budget"]["selected_metrics"]["var_99"])
+
+
+def test_evt_rolling_fit_keeps_expected_shortfall_finite(monkeypatch):
+    from quant_risk_engine.engine_market_tail import evt
+    original_fit = evt.genpareto.fit
+    monkeypatch.setattr(evt.genpareto, "fit", lambda *args, **kwargs: (1.1, 0., .01))
+    losses = np.random.default_rng(42).standard_t(4, 260) * .01
+    fit = evt.fit_pot(losses, .9)
+    var, es = evt.pot_var_es(fit, .995)
+    assert fit.shape < .95 and np.isfinite([var, es]).all() and es >= var
+    monkeypatch.setattr(evt.genpareto, "fit", original_fit)
