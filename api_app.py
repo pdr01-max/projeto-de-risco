@@ -215,11 +215,18 @@ def _fx_cached(start: date, end: date, bucket: int) -> pd.Series:
 
 
 def _cash_returns(returns: pd.DataFrame, tickers: list[str]) -> np.ndarray:
-    """Cash levels grow by daily CDI in BRL; USD portfolios divide by USD/BRL."""
+    """Cash grows at observed CDI; a declared annual proxy covers BCB outages."""
     previous = pd.Timestamp(returns.attrs["first_price_date"])
     dates = pd.DatetimeIndex([previous]).append(returns.index)
-    cdi = _cdi_cached(previous.date(), dates[-1].date(), int(time.time() // 86400))
-    daily = cdi.reindex(pd.date_range(previous, dates[-1], freq="D"), fill_value=0.)
+    try:
+        cdi = _cdi_cached(previous.date(), dates[-1].date(), int(time.time() // 86400))
+        daily = cdi.reindex(pd.date_range(previous, dates[-1], freq="D"), fill_value=0.)
+        returns.attrs["cash_rate_source"] = "CDI observado (BCB SGS 12)"
+    except HTTPException:
+        annual = float(returns.attrs.get("risk_free_annual", .1125))
+        calendar_rate = (1 + annual) ** (1 / 365.25) - 1
+        daily = pd.Series(calendar_rate, index=pd.date_range(previous, dates[-1], freq="D"))
+        returns.attrs["cash_rate_source"] = f"Taxa anual informada ({annual:.2%}); CDI histórico indisponível"
     levels = (1 + daily).cumprod().reindex(dates).to_numpy()
     if returns.attrs.get("base_currency", "BRL") == "USD":
         fx = _fx_cached((previous - timedelta(days=7)).date(), dates[-1].date(), int(time.time() // 1800))
@@ -781,6 +788,7 @@ def portfolio_risk(request: PortfolioRequest) -> dict:
                 "return_annualized": (1 + total_return) ** (365.25 / holding_days) - 1
                                      if holding_days > 0 else None,
             })
+    returns.attrs["risk_free_annual"] = float(request.risk_free_annual)
     cash_series = _cash_returns(returns, request.tickers)
     risk_free = float(request.risk_free_annual)
     daily_rf = (1+risk_free)**(1/252)-1
@@ -823,6 +831,7 @@ def portfolio_risk(request: PortfolioRequest) -> dict:
             "metrics": metrics, "limits": limits, "base_currency": request.base_currency,
             "capital": request.capital, "var_model": request.var_model,
             "confidence": request.confidence, "risk_free_annual": risk_free,
+            "cash_rate_source": returns.attrs.get("cash_rate_source", "CDI observado (BCB SGS 12)"),
             "tail_diagnostics": tail_diagnostics, "liquidity": liquidity,
             "election_stress": election_stress,
             "dates": returns.index.strftime("%Y-%m-%d").tolist(),
