@@ -16,6 +16,8 @@ def prices(monkeypatch):
     monkeypatch.setattr(api_app, "_fx_cached", lambda start, end, bucket: pd.Series(5., index=prices.index))
     monkeypatch.setattr(api_app, "_cash_returns", lambda returns, tickers: np.full(len(returns), .0004))
     monkeypatch.setattr(api_app, "_stress_tests", lambda request, weights, bucket: [])
+    monkeypatch.setattr(api_app, "_election_stress", lambda request, weights, returns: {"available": False})
+    monkeypatch.setattr(api_app, "_purchase_dividends", lambda *args: 0.)
     return prices
 
 
@@ -122,9 +124,9 @@ def test_purchase_split_adjusts_share_count(prices, monkeypatch):
         purchases={"AAPL": {"date": "2025-01-10", "price": 100., "quantity": 10.}}))
     lot = result["purchase_analysis"][0]
     assert lot["adjusted_quantity"] == 20
-    assert lot["cost"] == 1000
-    assert lot["market_value"] == 1200
-    assert lot["pnl"] == 200
+    assert lot["cost"] == 5000
+    assert lot["market_value"] == 6000
+    assert lot["pnl"] == 1000
 
 
 def test_garch_forecast_and_out_of_sample():
@@ -156,3 +158,85 @@ def test_benchmark_changes_with_base_currency(monkeypatch):
 def test_2008_replaces_2022_stress_window():
     assert any("2008" in label for label in api_app.STRESS_WINDOWS)
     assert all("2022" not in label for label in api_app.STRESS_WINDOWS)
+
+
+def test_evt_tail_and_filtered_garch(monkeypatch):
+    from quant_risk_engine.engine_market_tail.volatility import GarchFit
+    rng = np.random.default_rng(120)
+    series = rng.standard_t(5, 500)*.012
+    series[0] = -.18
+    monkeypatch.setattr(api_app, "fit_garch", lambda x: GarchFit(.02,.07,.89,0.,6.,0.,1.,-1.,100.))
+    monkeypatch.setattr(api_app, "forecast_garch", lambda fit: (0., .012))
+    for model in ("evt", "filtered_ewma_evt", "filtered_garch_evt"):
+        scenarios, diagnostic = api_app._risk_scenarios(
+            series, series[:, None], np.array([1.]), model, .90, 12000)
+        var, es = api_app.historical_var_es(scenarios, .99)
+        assert np.isfinite([var, es, diagnostic["shape"], diagnostic["ks_p_value"]]).all()
+        assert es >= var and diagnostic["exceedances"] > 0
+
+
+def test_student_t_copula_joint_tail():
+    rng = np.random.default_rng(91)
+    shared = rng.standard_t(5, 450)*.012
+    assets = np.column_stack([shared+rng.normal(0,.003,450),
+                              .7*shared+rng.normal(0,.005,450)])
+    scenarios, diagnostic = api_app._risk_scenarios(
+        assets @ np.array([.6,.4]), assets, np.array([.6,.4]),
+        "copula_evt", .9, 12000)
+    assert diagnostic["copula_nu"] > 2
+    assert np.isclose(np.linalg.eigvalsh(diagnostic["copula_correlation"]).min() >= 0, True)
+    assert np.isfinite(scenarios).all()
+
+
+def test_christoffersen_and_consistent_budget():
+    rng = np.random.default_rng(14)
+    history = rng.normal(0,.02,400)
+    dates = pd.date_range("2024-01-01", periods=400, freq="B")
+    result = api_app._backtest(history, dates, "historical", .995)
+    assert np.isfinite([result["p_ind"], result["p_cc"]]).all()
+    assert np.isclose(result["lr_cc"], result["lr_pof"]+result["lr_ind"])
+    scenarios = rng.normal(0,.025,10000)
+    limits = {"var_99": .03, "es_99": .05, "volatility_annual": .5, "max_drawdown": .8}
+    budget = api_app._risk_budget(history, pd.Series({"AAPL": 1.}), limits,
+                                  np.full(400,.0004), scenarios, .995)
+    assert np.isclose(budget["selected_metrics"]["var_99"],
+                      np.quantile(-scenarios,.995))
+
+
+def test_liquidity_and_election_stress(monkeypatch):
+    rng = np.random.default_rng(13)
+    dates = pd.date_range("2025-01-01", periods=160, freq="B")
+    factors = pd.DataFrame({"^BVSP":100*np.cumprod(1+rng.normal(0,.01,160)),
+                            "^GSPC":100*np.cumprod(1+rng.normal(0,.01,160))},index=dates)
+    fx = pd.Series(5*np.cumprod(1+rng.normal(0,.002,160)),index=dates)
+    asset = pd.DataFrame({"AAPL": .8*factors["^GSPC"].pct_change(fill_method=None).fillna(0)
+                           +.3*fx.pct_change(fill_method=None).fillna(0)},index=dates)
+    monkeypatch.setattr(api_app,"_download_cached",lambda *args: factors)
+    monkeypatch.setattr(api_app,"_fx_cached",lambda *args: fx)
+    monkeypatch.setattr(api_app,"_volume_cached",lambda *args: 1_000_000.)
+    request = api_app.PortfolioRequest(tickers=["AAPL"],weights=[1.],liquidity=True)
+    liquid = api_app._liquidity_adjustment(request,pd.Series({"AAPL":1.}),asset,.03,.05)
+    stress = api_app._election_stress(request,pd.Series({"AAPL":1.}),asset)
+    assert liquid["lvar"] > .03 and liquid["days"] >= 1
+    assert np.isfinite([stress["return"],stress["pnl"]]).all()
+
+
+def test_dividends_follow_split_and_base_currency(monkeypatch):
+    dates = pd.to_datetime(["2025-01-15", "2025-02-15"])
+    dividends = pd.Series([1., 2.], index=dates)
+    splits = pd.Series([2.], index=pd.to_datetime(["2025-02-01"]))
+    monkeypatch.setattr(api_app, "_dividend_events_cached", lambda *args: (dividends, splits))
+    monkeypatch.setattr(api_app, "_fx_cached", lambda *args:
+                        pd.Series([5., 6.], index=dates))
+    total = api_app._purchase_dividends("AAPL", api_app.date(2025,1,1), 10., "BRL", 0)
+    assert np.isclose(total, 290.)
+
+
+def test_evt_api_json_and_limit_alignment(prices):
+    result = api_app.portfolio_risk(api_app.PortfolioRequest(
+        tickers=["AAPL", "PETR4.SA"], weights=[.6,.4], var_model="evt",
+        confidence=.995, threshold_quantile=.90))
+    json.dumps(result, allow_nan=False)
+    assert result["risk_budget"]["model"] == "evt"
+    assert np.isclose(result["metrics"]["var_99"],
+                      result["risk_budget"]["selected_metrics"]["var_99"])
