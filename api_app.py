@@ -33,10 +33,11 @@ from quant_risk_engine.engine_portfolio import MinCVaROptimizer, RiskParityOptim
 
 STATIC = Path(__file__).resolve().parent / "static"
 TICKER = re.compile(r"^[A-Z0-9^][A-Z0-9.^=-]{0,19}$")
-METHODS = {"manual", "max_sharpe", "min_cvar", "risk_parity", "hrp"}
+METHODS = {"manual", "equal", "max_sharpe", "min_cvar", "risk_parity", "hrp"}
 VAR_MODELS = {"historical", "normal", "ewma", "garch", "monte_carlo",
               "evt", "filtered_ewma_evt", "filtered_garch_evt", "copula_evt"}
 BENCHMARKS = {"none", "^BVSP", "^GSPC"}
+STRESS_PRESETS = {"none", "custom", "election", "fx", "global"}
 STRESS_WINDOWS = {"Covid (fev–mar/2020)": ("2020-02-19", "2020-03-24"),
                   "Crise financeira (2008)": ("2008-09-12", "2008-11-22")}
 app = FastAPI(title="Quant Risk Engine", version="2.0")
@@ -59,6 +60,7 @@ class PortfolioRequest(BaseModel):
     threshold_quantile: float = Field(default=.90, ge=.90, le=.975)
     risk_free_annual: float | None = Field(default=None, ge=-.99, le=1.)
     liquidity: bool = False
+    stress_preset: str = "none"
     stress_ibov: float = Field(default=-.15, ge=-1, le=2)
     stress_sp500: float = Field(default=-.08, ge=-1, le=2)
     stress_fx: float = Field(default=.12, ge=-.9, le=2)
@@ -85,6 +87,8 @@ class PortfolioRequest(BaseModel):
             raise ValueError("Período ou método de alocação inválido")
         if self.base_currency not in {"BRL", "USD"} or self.var_model not in VAR_MODELS or self.benchmark not in BENCHMARKS:
             raise ValueError("Moeda, modelo de VaR ou benchmark inválido")
+        if self.stress_preset not in STRESS_PRESETS:
+            raise ValueError("Cenário de stress inválido")
         if self.confidence not in {.99, .995, .999} or self.threshold_quantile not in {.90, .95, .975}:
             raise ValueError("Confiança ou limiar EVT inválido")
         if self.risk_free_annual is None:
@@ -571,7 +575,7 @@ def _liquidity_adjustment(request: PortfolioRequest, weights: pd.Series,
         days = max(1, int(np.ceil(position / (.1 * adv))))
         participation = position / max(adv * days, 1.)
         daily_sigma = float(asset_returns[symbol].std(ddof=1))
-        spread = .002 * request.stress_slippage_multiplier
+        spread = .002
         cost = position * (spread/2 + .1*daily_sigma*np.sqrt(participation))
         rows.append({"ticker": symbol, "adv": adv, "position": position,
                      "days": days, "cost": cost})
@@ -585,6 +589,8 @@ def _liquidity_adjustment(request: PortfolioRequest, weights: pd.Series,
 def _election_stress(request: PortfolioRequest, weights: pd.Series,
                      asset_returns: pd.DataFrame) -> dict:
     """Factor OLS r_i=B_i f+epsilon; translate local shocks through shocked FX."""
+    if request.stress_preset == "none":
+        return {"available": False, "reason": "none"}
     bucket = int(time.time() // 1800)
     factors = _download_cached(("^BVSP", "^GSPC"), request.period, bucket,
                                request.start_date.isoformat() if request.start_date else None,
@@ -615,7 +621,7 @@ def _election_stress(request: PortfolioRequest, weights: pd.Series,
     impact = float(stressed @ w)
     if request.liquidity:
         liquidity = _liquidity_adjustment(request, weights, asset_returns, 0., 0.)
-        impact -= liquidity["execution_cost"] * request.stress_slippage_multiplier / request.capital
+        impact -= liquidity["execution_cost"] * (request.stress_slippage_multiplier - 1) / request.capital
     return {"return": impact, "pnl": impact*request.capital,
             "asset_impacts": dict(zip(request.tickers, stressed.tolist())),
             "factor_betas": {symbol: dict(zip(("intercept", "ibov", "sp500", "fx"), beta[:, i].tolist()))
@@ -641,6 +647,8 @@ def _max_sharpe(returns: pd.DataFrame) -> pd.Series:
 def _optimize(returns: pd.DataFrame, method: str) -> pd.Series:
     if returns.shape[1] == 1:
         return pd.Series([1.], index=returns.columns)
+    if method == "equal":
+        return pd.Series(np.full(returns.shape[1], 1 / returns.shape[1]), index=returns.columns)
     try:
         if method == "max_sharpe":
             return _max_sharpe(returns)
@@ -849,6 +857,6 @@ def portfolio_risk(request: PortfolioRequest) -> dict:
 @app.post("/api/optimize")
 def optimize(request: PortfolioRequest) -> dict:
     returns = _returns(request)
-    methods = ("max_sharpe", "min_cvar", "risk_parity", "hrp")
+    methods = ("equal", "max_sharpe", "min_cvar", "risk_parity", "hrp")
     allocations = {name: _optimize(returns, name).to_dict() for name in methods}
     return {"tickers": request.tickers, "allocations": allocations, "observations": len(returns)}
