@@ -2,7 +2,8 @@
 from dataclasses import dataclass
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
-from scipy.stats import kendalltau, norm, rankdata, t
+from scipy.stats import kendalltau, norm, rankdata, t, multivariate_t
+from scipy.optimize import minimize_scalar
 from quant_risk_engine.core.matrix import validate_correlation
 
 
@@ -14,12 +15,12 @@ class CopulaFit:
     clayton_theta: float = 0.0
 
 
-def fit_copula(returns: ArrayLike, family: str = "student_t", degrees_of_freedom: float = 6) -> CopulaFit:
+def fit_copula(returns: ArrayLike, family: str = "student_t", degrees_of_freedom: float | None = 6) -> CopulaFit:
     """Estimate pseudo-observations rank/(T+1); elliptical correlation from transformed ranks; Clayton theta=2*tau/(1-tau)."""
     x = np.asarray(returns, float)
     if x.ndim != 2 or x.shape[0] < 30 or x.shape[1] < 2 or not np.isfinite(x).all():
         raise ValueError("finite T x N sample required")
-    if family not in {"gaussian", "student_t", "clayton"} or degrees_of_freedom <= 2:
+    if family not in {"gaussian", "student_t", "clayton"} or (degrees_of_freedom is not None and degrees_of_freedom <= 2):
         raise ValueError("unsupported family or degrees of freedom")
     u = rankdata(x, axis=0)/(len(x)+1)
     if family == "clayton":
@@ -29,6 +30,17 @@ def fit_copula(returns: ArrayLike, family: str = "student_t", degrees_of_freedom
         if not 0 < tau < 1:
             raise ValueError("Clayton requires positive dependence")
         return CopulaFit(family, np.eye(2), clayton_theta=2*tau/(1-tau))
+    if family == "student_t" and degrees_of_freedom is None:
+        def negative_log_likelihood(nu: float) -> float:
+            transformed = t.ppf(u, nu)
+            correlation = validate_correlation(np.corrcoef(transformed, rowvar=False))
+            joint = multivariate_t.logpdf(transformed, shape=correlation, df=nu)
+            marginal = t.logpdf(transformed, nu).sum(axis=1)
+            return float(-np.sum(joint-marginal))
+        search = minimize_scalar(negative_log_likelihood, bounds=(2.1, 40.), method="bounded")
+        if not search.success:
+            raise ValueError("Student-t copula calibration failed")
+        degrees_of_freedom = float(search.x)
     z = norm.ppf(u) if family == "gaussian" else t.ppf(u, degrees_of_freedom)
     return CopulaFit(family, validate_correlation(np.corrcoef(z, rowvar=False)), degrees_of_freedom)
 
