@@ -40,11 +40,15 @@ async function post(url, payload) {
 }
 
 function renderRisk(data) {
+  const confidenceLabel = `${(data.confidence*100).toLocaleString('pt-BR')}%`;
+  $('card-var').querySelector('.metric-label').textContent = `VaR ${confidenceLabel} / dia`;
+  $('card-es').querySelector('.metric-label').textContent = `Expected Shortfall ${confidenceLabel}`;
   setAlert('var', data.metrics.var_99, data.limits.var_99);
   setAlert('es', data.metrics.es_99, data.limits.es_99);
   setAlert('vol', data.metrics.volatility_annual, data.limits.volatility_annual);
   setAlert('dd', data.metrics.max_drawdown, data.limits.max_drawdown);
   $('es-value').textContent = pct(data.metrics.es_99);
+  $('es-value').parentElement.firstChild.textContent = `ES ${confidenceLabel}: `;
   $('return-annual').textContent = pct(data.metrics.return_annual);
   $('downside-vol').textContent = pct(data.metrics.downside_volatility_annual);
   $('var-95').textContent = pct(data.metrics.var_95);
@@ -57,12 +61,20 @@ function renderRisk(data) {
   const kupiec = data.backtest;
   $('kupiec-status').textContent = kupiec.status;
   $('kupiec-status').className = kupiec.status === 'Aprovado' ? 'result-approved' : kupiec.status === 'Atenção' ? 'result-warning' : 'result-rejected';
-  $('kupiec-details').textContent = `${kupiec.breaches} violações em ${kupiec.observations} observações fora da amostra · esperado: ${kupiec.expected.toFixed(1)} · p-valor: ${kupiec.p_value.toFixed(4)}. Previsões calculadas apenas com dados anteriores a cada dia.`;
+  $('kupiec-details').textContent = `${kupiec.breaches} violações em ${kupiec.observations} observações fora da amostra · esperado: ${kupiec.expected.toFixed(1)} · Kupiec p=${kupiec.p_value.toFixed(4)} · independência p=${kupiec.p_ind.toFixed(4)} · cobertura conjunta p=${kupiec.p_cc.toFixed(4)}. Previsões usam apenas dados anteriores a cada dia.`;
+  const diag = data.tail_diagnostics;
+  const items = diag?.marginals ? Object.entries(diag.marginals).map(([i, value]) => `${data.tickers[Number(i)]}: ξ=${value.shape.toFixed(3)}, β=${value.scale.toFixed(3)}, Nu=${value.exceedances}, KS p=${value.ks_p_value.toFixed(3)}${value.warning ? ' · amostra de cauda pequena' : ''}`) : diag ? [`ξ=${diag.shape.toFixed(3)}, β=${diag.scale.toFixed(3)}, Nu=${diag.exceedances}, KS p=${diag.ks_p_value.toFixed(3)}${diag.warning ? ' · amostra de cauda pequena' : ''}`] : [];
+  const contributions = diag?.tail_es_contribution?.map((value, i) => `${data.tickers[i]}: ${pct(value)}`).join(', ');
+  $('tail-diagnostic').textContent = items.length ? `${items.join(' | ')}${diag.copula_nu ? ` · cópula ν=${diag.copula_nu.toFixed(2)}` : ''}${contributions ? ` · Contribuição ao ES conjunto: ${contributions}` : ''}` : 'O modelo selecionado não ajusta uma GPD.';
+  const liq = data.liquidity;
+  $('liquidity-results').textContent = liq ? `LVaR ${pct(liq.lvar)} (${money(liq.lvar * data.capital, data.base_currency)}); ES ajustado ${pct(liq.les)}. Liquidação estimada: ${liq.days} dia(s) úteis a até 10% do ADV; custo estimado ${money(liq.execution_cost, data.base_currency)}.` : 'Ative a opção de liquidez.';
+  const event = data.election_stress;
+  $('election-results').textContent = event?.available === false ? 'Sensibilidades indisponíveis para esta janela.' : `Impacto estimado: ${pct(event.return)} (${money(event.pnl, data.base_currency)}). Choques de fatores e contágio conforme os campos selecionados.`;
   const stressBody = $('stress-results');
   stressBody.replaceChildren();
   data.stress_tests.forEach(item => {
     const row = document.createElement('tr');
-    [item.scenario, `${item.start} a ${item.end}`, item.available ? pct(item.return) : 'Histórico indisponível',
+    [item.scenario + (item.available && !item.complete ? ' · histórico parcial' : ''), `${item.start} a ${item.end}`, item.available ? pct(item.return) : 'Histórico indisponível',
       item.available ? money(item.pnl, data.base_currency) : '—'].forEach(value => {
       const cell = document.createElement('td'); cell.textContent = value; row.append(cell);
     });
@@ -76,8 +88,9 @@ function renderRisk(data) {
   (data.purchase_analysis || []).forEach(item => {
     const row = document.createElement('tr');
     const localMoney = value => money(value, item.currency);
+    const baseMoney = value => money(value, item.base_currency);
     [item.ticker, item.date, item.holding_days, item.quantity, item.split_factor.toFixed(4), item.adjusted_quantity,
-      localMoney(item.purchase_price), localMoney(item.current_price), localMoney(item.cost), localMoney(item.market_value), localMoney(item.pnl), pct(item.return),
+      localMoney(item.purchase_price), localMoney(item.current_price), baseMoney(item.cost), baseMoney(item.market_value), baseMoney(item.dividends), baseMoney(item.pnl), pct(item.return),
       item.return_annualized === null ? '—' : pct(item.return_annualized)].forEach(value => {
       const cell = document.createElement('td');
       cell.textContent = value;
@@ -116,6 +129,10 @@ function renderRisk(data) {
   if (kupiec.breach_dates.length) wealthTraces.push({ x: kupiec.breach_dates, y: kupiec.breach_wealth,
     type: 'scatter', mode: 'markers', name: 'Violação VaR', marker: { color: chartColors.red, size: 8, symbol: 'x' },
     hovertemplate: '%{x}<br>Violação VaR<extra></extra>' });
+  if (kupiec.cluster_dates?.length) wealthTraces.push({ x: kupiec.cluster_dates,
+    y: kupiec.cluster_dates.map(day => data.wealth_index[data.dates.indexOf(day)]),
+    type: 'scatter', mode: 'markers', name: 'Violações consecutivas',
+    marker: { color: '#ff4050', size: 12, symbol: 'diamond' } });
   Plotly.react('wealth-chart', wealthTraces, layout({ yaxis: { gridcolor: chartColors.grid, title: 'Base 1,0' } }), config);
   Plotly.react('loss-chart', [{ x: data.daily_losses.map(x => x * 100), type: 'histogram',
     marker: { color: '#5b7990', line: { color: chartColors.steel, width: .4 } }, nbinsx: 45,
@@ -138,8 +155,8 @@ function renderRiskBudget(data) {
   status.className = budget.breaches.length ? 'status error mt-3 mb-2' : 'status mt-3 mb-2';
   $('cash-note').textContent = budget.cash_return_annual === null
     ? 'Nenhum rebalanceamento necessário.'
-    : `Caixa: 100% do CDI histórico em BRL, antes de taxas e impostos${data.tickers.some(x => !x.endsWith('.SA')) ? ', convertido para USD pela série USD/BRL' : ''}. Retorno anualizado do caixa: ${pct(budget.cash_return_annual)}; do cenário: ${pct(budget.recommended_return_annual)}. Os pesos são simulados com rebalanceamento diário e não representam ordens de negociação.`;
-  const names = { var_99: 'VaR 99%', es_99: 'ES 99%', volatility_annual: 'Volatilidade anual', max_drawdown: 'Max drawdown' };
+    : `Caixa: 100% do CDI histórico em BRL, antes de taxas e impostos${data.base_currency === 'USD' ? ', convertido para USD pela série USD/BRL' : ''}. Retorno anualizado do caixa: ${pct(budget.cash_return_annual)}; do cenário: ${pct(budget.recommended_return_annual)}. Os pesos são simulados com rebalanceamento diário e não representam ordens de negociação.`;
+  const names = { var_99: `VaR ${(data.confidence*100).toLocaleString('pt-BR')}%`, es_99: `ES ${(data.confidence*100).toLocaleString('pt-BR')}%`, volatility_annual: 'Volatilidade anual', max_drawdown: 'Max drawdown' };
   const breachList = $('breach-list');
   breachList.replaceChildren();
   budget.breaches.forEach(item => {
@@ -239,10 +256,12 @@ function updateTotal() {
 }
 function toggleMethod() { $('manual-weights').hidden = $('method').value !== 'manual'; $('weight-total').hidden = $('method').value !== 'manual'; }
 const shareKeys = ['tickers', 'period', 'method', 'base-currency', 'capital', 'var-model', 'benchmark',
-  'var-limit', 'es-limit', 'vol-limit', 'dd-limit'];
+  'var-limit', 'es-limit', 'vol-limit', 'dd-limit', 'confidence', 'threshold-quantile', 'risk-free',
+  'stress-preset', 'stress-ibov', 'stress-sp500', 'stress-fx', 'stress-vol', 'stress-contagion', 'stress-slippage'];
 function shareURL() {
   const params = new URLSearchParams();
   shareKeys.forEach(id => params.set(id, $(id).value));
+  params.set('liquidity', $('liquidity').checked ? '1' : '0');
   if ($('period').value === 'custom') { params.set('start-date', $('start-date').value); params.set('end-date', $('end-date').value); }
   if ($('method').value === 'manual') params.set('weights', [...document.querySelectorAll('.weight-input')].map(x => x.value).join(','));
   return `${location.origin}${location.pathname}?${params.toString()}`;
@@ -255,6 +274,8 @@ function restoreURL() {
     $('method').value = 'risk_parity';
   } else {
     shareKeys.forEach(id => { if (params.has(id)) $(id).value = params.get(id); });
+    $('liquidity').checked = params.get('liquidity') === '1';
+    if (!params.has('risk-free')) $('risk-free').value = $('base-currency').value === 'BRL' ? '11.25' : '4.50';
     $('start-date').value = params.get('start-date') || '';
     $('end-date').value = params.get('end-date') || '';
   }
@@ -272,6 +293,9 @@ let tickerTimer;
 $('tickers').addEventListener('input', () => { clearTimeout(tickerTimer); tickerTimer = setTimeout(() => { refreshWeights(); syncURL(); }, 250); });
 $('method').addEventListener('change', () => { toggleMethod(); syncURL(); });
 $('period').addEventListener('change', () => { $('custom-dates').hidden = $('period').value !== 'custom'; syncURL(); });
+$('base-currency').addEventListener('change', () => { $('risk-free').value = $('base-currency').value === 'BRL' ? '11.25' : '4.50'; syncURL(); });
+const stressPresets = { election: [-20,-5,15,3,.8,3], fx: [-10,-3,25,2,.6,4], global: [-15,-25,10,3,.9,3] };
+$('stress-preset').addEventListener('change', () => { const values = stressPresets[$('stress-preset').value]; if (values) ['stress-ibov','stress-sp500','stress-fx','stress-vol','stress-contagion','stress-slippage'].forEach((id,i) => { $(id).value = values[i]; }); syncURL(); });
 document.querySelectorAll('.preset').forEach(button => button.addEventListener('click', () => { $('tickers').value = button.dataset.tickers; refreshWeights(); syncURL(); }));
 $('risk-form').addEventListener('change', syncURL);
 $('risk-form').addEventListener('input', event => { if (event.target.id !== 'tickers') syncURL(); });
@@ -294,6 +318,11 @@ $('risk-form').addEventListener('submit', async (event) => {
     base_currency: $('base-currency').value,
     capital: Number($('capital').value),
     var_model: $('var-model').value,
+    confidence: Number($('confidence').value), threshold_quantile: Number($('threshold-quantile').value),
+    risk_free_annual: Number($('risk-free').value)/100, liquidity: $('liquidity').checked,
+    stress_ibov: Number($('stress-ibov').value)/100, stress_sp500: Number($('stress-sp500').value)/100,
+    stress_fx: Number($('stress-fx').value)/100, stress_vol_multiplier: Number($('stress-vol').value),
+    stress_contagion: Number($('stress-contagion').value), stress_slippage_multiplier: Number($('stress-slippage').value),
     benchmark: $('benchmark').value,
     var_limit: Number($('var-limit').value) / 100,
     es_limit: Number($('es-limit').value) / 100,
