@@ -2,6 +2,7 @@
 from dataclasses import dataclass
 import numpy as np
 from numpy.typing import ArrayLike
+from scipy.optimize import minimize
 from scipy.stats import genpareto, kstest
 
 
@@ -26,6 +27,23 @@ def fit_pot(losses: ArrayLike, threshold_quantile: float = 0.90) -> POTFit:
     if len(excess) < 5:
         raise ValueError("at least 5 threshold exceedances required")
     shape, _, scale = genpareto.fit(excess, floc=0)
+    if np.isfinite(shape) and shape >= .95:
+        # Constrain xi below one so ES remains finite in short rolling windows.
+        def negative_log_likelihood(parameters: np.ndarray) -> float:
+            xi, log_scale = parameters
+            beta = np.exp(log_scale)
+            support = 1 + xi * excess / beta
+            if np.any(support <= 0):
+                return 1e12
+            if abs(xi) < 1e-7:
+                return float(len(excess) * log_scale + np.sum(excess / beta))
+            return float(len(excess) * log_scale + (1 + 1 / xi) * np.log(support).sum())
+
+        regularized = minimize(negative_log_likelihood,
+                               np.array([.5, np.log(np.mean(excess))]),
+                               method="L-BFGS-B", bounds=[(-.5, .9), (None, None)])
+        if regularized.success:
+            shape, scale = float(regularized.x[0]), float(np.exp(regularized.x[1]))
     if not np.isfinite([shape, scale]).all() or scale <= 0 or shape >= .95:
         raise ValueError("GPD tail has invalid or infinite-ES shape")
     p_value = float(kstest(excess, "genpareto", args=(shape, 0, scale)).pvalue)
