@@ -29,11 +29,40 @@ def test_manual_portfolios_are_isolated(prices):
     assert first["wealth_index"] != second["wealth_index"]
 
 
-@pytest.mark.parametrize("method", ["max_sharpe", "min_cvar", "risk_parity", "hrp"])
+def test_none_stress_skips_hypothetical_factors(monkeypatch):
+    def unavailable(*args, **kwargs):
+        raise AssertionError("Stress desativado não deve buscar fatores de mercado")
+    monkeypatch.setattr(api_app, "_download_cached", unavailable)
+    request = api_app.PortfolioRequest(tickers=["AAPL"], weights=[1.],
+                                       stress_preset="none", stress_ibov=-.8)
+    result = api_app._election_stress(request, pd.Series({"AAPL": 1.}),
+                                      pd.DataFrame({"AAPL": [.01, -.01]}))
+    assert result == {"available": False, "reason": "none"}
+    with pytest.raises(ValueError):
+        api_app.PortfolioRequest(tickers=["AAPL"], weights=[1.], stress_preset="invalid")
+
+
+def test_liquidity_estimate_does_not_inherit_hypothetical_slippage(monkeypatch):
+    dates = pd.date_range("2025-01-01", periods=90, freq="B")
+    history = pd.DataFrame({"AAPL": np.linspace(-.01, .01, len(dates))}, index=dates)
+    monkeypatch.setattr(api_app, "_fx_cached", lambda *args: pd.Series([5.], index=[dates[-1]]))
+    monkeypatch.setattr(api_app, "_volume_cached", lambda *args: 1_000_000.)
+    first = api_app.PortfolioRequest(tickers=["AAPL"], weights=[1.], liquidity=True,
+                                     stress_preset="none", stress_slippage_multiplier=1.)
+    second = first.model_copy(update={"stress_slippage_multiplier": 8.})
+    weights = pd.Series({"AAPL": 1.})
+    base = api_app._liquidity_adjustment(first, weights, history, .02, .03)
+    changed = api_app._liquidity_adjustment(second, weights, history, .02, .03)
+    assert base == changed
+
+
+@pytest.mark.parametrize("method", ["equal", "max_sharpe", "min_cvar", "risk_parity", "hrp"])
 def test_optimizers(prices, method):
     risk = api_app.portfolio_risk(api_app.PortfolioRequest(tickers=["AAPL", "PETR4.SA"], method=method))
     assert np.isclose(sum(risk["weights"].values()), 1)
     assert all(weight >= 0 for weight in risk["weights"].values())
+    if method == "equal":
+        assert set(risk["weights"].values()) == {.5}
 
 
 def test_invalid_weights_and_static_route(prices):
@@ -214,7 +243,8 @@ def test_liquidity_and_election_stress(monkeypatch):
     monkeypatch.setattr(api_app,"_download_cached",lambda *args: factors)
     monkeypatch.setattr(api_app,"_fx_cached",lambda *args: fx)
     monkeypatch.setattr(api_app,"_volume_cached",lambda *args: 1_000_000.)
-    request = api_app.PortfolioRequest(tickers=["AAPL"],weights=[1.],liquidity=True)
+    request = api_app.PortfolioRequest(tickers=["AAPL"],weights=[1.],liquidity=True,
+                                       stress_preset="election")
     liquid = api_app._liquidity_adjustment(request,pd.Series({"AAPL":1.}),asset,.03,.05)
     stress = api_app._election_stress(request,pd.Series({"AAPL":1.}),asset)
     assert liquid["lvar"] > .03 and liquid["days"] >= 1
