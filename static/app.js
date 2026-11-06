@@ -155,7 +155,7 @@ function renderRiskBudget(data) {
   status.className = budget.breaches.length ? 'status error mt-3 mb-2' : 'status mt-3 mb-2';
   $('cash-note').textContent = budget.cash_return_annual === null
     ? 'Nenhum rebalanceamento necessário.'
-    : `Caixa: 100% do CDI histórico em BRL, antes de taxas e impostos${data.base_currency === 'USD' ? ', convertido para USD pela série USD/BRL' : ''}. Retorno anualizado do caixa: ${pct(budget.cash_return_annual)}; do cenário: ${pct(budget.recommended_return_annual)}. Os pesos são simulados com rebalanceamento diário e não representam ordens de negociação.`;
+    : `Caixa: ${data.cash_rate_source || 'CDI observado (BCB SGS 12)'} em BRL, antes de taxas e impostos${data.base_currency === 'USD' ? ', convertido para USD pela série USD/BRL' : ''}. Retorno anualizado do caixa: ${pct(budget.cash_return_annual)}; do cenário: ${pct(budget.recommended_return_annual)}. Os pesos são simulados com rebalanceamento diário e não representam ordens de negociação.`;
   const names = { var_99: `VaR ${(data.confidence*100).toLocaleString('pt-BR')}%`, es_99: `ES ${(data.confidence*100).toLocaleString('pt-BR')}%`, volatility_annual: 'Volatilidade anual', max_drawdown: 'Max drawdown' };
   const breachList = $('breach-list');
   breachList.replaceChildren();
