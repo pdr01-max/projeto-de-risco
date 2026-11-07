@@ -18,6 +18,8 @@ def prices(monkeypatch):
     monkeypatch.setattr(api_app, "_stress_tests", lambda request, weights, bucket: [])
     monkeypatch.setattr(api_app, "_election_stress", lambda request, weights, returns: {"available": False})
     monkeypatch.setattr(api_app, "_purchase_dividends", lambda *args: 0.)
+    monkeypatch.setattr(api_app, "_reference_rate", lambda request, returns:
+                        {"annual": .1125, "mode": "manual", "source": "Teste", "as_of": None})
     return prices
 
 
@@ -63,6 +65,57 @@ def test_optimizers(prices, method):
     assert all(weight >= 0 for weight in risk["weights"].values())
     if method == "equal":
         assert set(risk["weights"].values()) == {.5}
+
+
+def test_max_sharpe_tangency_uses_excess_mean():
+    rng = np.random.default_rng(481)
+    true_mean = np.array([.001, .0014])
+    true_cov = np.array([[.0001, .000015], [.000015, .0004]])
+    frame = pd.DataFrame(rng.multivariate_normal(true_mean, true_cov, 4000), columns=["A", "B"])
+    estimated_mean = frame.mean().to_numpy()
+    estimated_cov = api_app.ledoit_wolf_covariance(frame.to_numpy())
+    annual_rf = (1 + .0002)**252 - 1
+    for rate, daily in [(0., 0.), (annual_rf, .0002)]:
+        tangent = np.linalg.solve(estimated_cov, estimated_mean - daily)
+        expected = tangent / tangent.sum()
+        actual = api_app._max_sharpe(frame, rate).to_numpy()
+        assert np.all(expected > 0)
+        assert np.allclose(actual, expected, atol=5e-3)
+    assert not np.allclose(api_app._max_sharpe(frame, 0.),
+                           api_app._max_sharpe(frame, annual_rf))
+
+
+def test_automatic_reference_rates_and_fallback(monkeypatch):
+    dates = pd.date_range("2025-01-01", periods=150, freq="B")
+    frame = pd.DataFrame({"AAPL": np.zeros(len(dates))}, index=dates)
+    cdi = pd.Series(.0005, index=dates)
+    monkeypatch.setattr(api_app, "_cdi_cached", lambda *args: cdi)
+    brl = api_app._reference_rate(api_app.PortfolioRequest(tickers=["AAPL"], weights=[1.]), frame)
+    assert brl["mode"] == "automatic" and brl["as_of"] == str(dates[-1].date())
+    assert np.isclose(brl["annual"], (1+.0005)**252-1)
+    monkeypatch.setattr(api_app, "_dtb3_cached", lambda *args: pd.Series(4., index=dates))
+    usd_request = api_app.PortfolioRequest(tickers=["AAPL"], weights=[1.], base_currency="USD")
+    usd = api_app._reference_rate(usd_request, frame)
+    assert np.isclose(usd["annual"], .04) and "FRED DTB3" in usd["source"]
+    monkeypatch.setattr(api_app, "_dtb3_cached", lambda *args: (_ for _ in ()).throw(OSError("FRED down")))
+    monkeypatch.setattr(api_app, "_irx_cached", lambda *args: pd.Series(4.2, index=dates))
+    fallback = api_app._reference_rate(usd_request, frame)
+    assert np.isclose(fallback["annual"], .042) and "^IRX" in fallback["source"]
+    monkeypatch.setattr(api_app, "_dtb3_cached", lambda *args: pd.Series(4., index=dates[:5]))
+    short_fred = api_app._reference_rate(usd_request, frame)
+    assert np.isclose(short_fred["annual"], .042) and "^IRX" in short_fred["source"]
+    old_client = api_app.PortfolioRequest(tickers=["AAPL"], weights=[1.], risk_free_annual=.11)
+    assert old_client.risk_free_mode == "manual"
+
+
+def test_fred_dtb3_parser(monkeypatch):
+    from io import BytesIO
+    sample = b"DATE,DTB3\n2026-10-01,4.12\n2026-10-02,.\n2026-10-05,4.08\n"
+    monkeypatch.setattr(api_app, "urlopen", lambda *args, **kwargs: BytesIO(sample))
+    api_app._dtb3_cached.cache_clear()
+    series = api_app._dtb3_cached(api_app.date(2026, 10, 1), api_app.date(2026, 10, 5), 999)
+    assert series.index.strftime("%Y-%m-%d").tolist() == ["2026-10-01", "2026-10-05"]
+    assert np.allclose(series.to_numpy(), [4.12, 4.08])
 
 
 def test_invalid_weights_and_static_route(prices):
@@ -131,7 +184,41 @@ def test_model_backtest_and_json(prices):
             base_currency="BRL", capital=100000))
         assert result["backtest"]["observations"] > 0
         assert np.isclose(sum(result["risk_contribution"].values()), 1)
+        assert {"0.95", "0.99"} <= result["backtest_levels"].keys()
+        assert result["backtest"]["status"] in {"Não rejeitado", "Atenção", "Rejeitado"}
+        assert 0 <= result["backtest"]["power_double_rate"] <= 1
+        assert np.isclose(sum(result["es_contribution"].values()),
+                          api_app.historical_var_es(-np.asarray(result["daily_losses"]), .99)[1])
         json.dumps(result, allow_nan=False)
+
+
+@pytest.mark.parametrize("method", ["max_sharpe", "risk_parity"])
+def test_sharpe_sortino_audit_independent(prices, method, caplog, monkeypatch):
+    # Six mixed synthetic assets and a two-year request mirror the production audit path.
+    names = ["PETR4.SA", "VALE3.SA", "ITUB4.SA", "AAPL", "SPY", "TLT"]
+    rng = np.random.default_rng(173)
+    returns = rng.normal(.0008, .012, (500, 6))
+    synthetic = pd.DataFrame(100*np.cumprod(1+returns, axis=0),
+                             index=pd.date_range("2024-01-01", periods=500, freq="B"), columns=names)
+    monkeypatch.setattr(api_app, "_download_cached", lambda *args: synthetic)
+    monkeypatch.setattr(api_app, "_fx_cached", lambda *args: pd.Series(5., index=synthetic.index))
+    caplog.set_level("INFO", logger="api_app")
+    request = api_app.PortfolioRequest(tickers=names, method=method,
+                                       period="2y", risk_free_annual=.1125)
+    result = api_app.portfolio_risk(request)
+    component = result["metric_inputs"]
+    daily_returns = -np.asarray(result["daily_losses"])
+    rf_daily = (1+.1125)**(1/252)-1
+    expected_sharpe = (daily_returns.mean()-rf_daily)*np.sqrt(252)/daily_returns.std(ddof=1)
+    expected_sortino = (daily_returns.mean()-rf_daily)*np.sqrt(252) / np.sqrt(np.mean(np.minimum(daily_returns-rf_daily, 0)**2))
+    assert component["observations"] == len(daily_returns)
+    assert component["annualization_days"] == 252
+    assert np.isclose(component["mean_daily"], daily_returns.mean())
+    assert np.isclose(component["risk_free_daily"], rf_daily)
+    assert np.isclose(component["volatility_daily"], daily_returns.std(ddof=1))
+    assert np.isclose(result["metrics"]["sharpe"], expected_sharpe)
+    assert np.isclose(result["metrics"]["sortino"], expected_sortino)
+    assert f'Sharpe/Sortino audit {{"method": "{method}"' in caplog.text
 
 
 def test_backtest_forecasts_do_not_see_realized_day():
@@ -187,6 +274,31 @@ def test_benchmark_changes_with_base_currency(monkeypatch):
 def test_2008_replaces_2022_stress_window():
     assert any("2008" in label for label in api_app.STRESS_WINDOWS)
     assert all("2022" not in label for label in api_app.STRESS_WINDOWS)
+
+
+def test_historical_stress_checks_both_window_edges(monkeypatch):
+    dates = pd.date_range("2020-02-19", periods=7, freq="B")
+    frame = pd.DataFrame({"AAPL": np.linspace(100, 90, len(dates))}, index=dates)
+    monkeypatch.setattr(api_app, "STRESS_WINDOWS", {"Teste": ("2020-02-19", "2020-03-24")})
+    monkeypatch.setattr(api_app, "_download_cached", lambda *args: frame)
+    result = api_app._stress_tests(api_app.PortfolioRequest(tickers=["AAPL"], weights=[1.],
+                                                               base_currency="USD"),
+                                    pd.Series({"AAPL": 1.}), 0)[0]
+    assert result["available"] and result["complete_start"]
+    assert not result["complete_end"] and not result["complete"]
+    assert "ponto a ponto" in result["method"]
+
+
+def test_garch_nonconvergence_has_visible_fallback(monkeypatch):
+    rng = np.random.default_rng(30)
+    history = rng.normal(0, .01, 300)
+    monkeypatch.setattr(api_app, "fit_garch", lambda *args: (_ for _ in ()).throw(RuntimeError("optimizer code 4")))
+    scenarios, diagnostic = api_app._risk_scenarios(history, history[:, None],
+                                                     np.array([1.]), "garch", .9, 3000)
+    assert np.isfinite(scenarios).all() and "EWMA" in diagnostic["warning"]
+    backtest = api_app._backtest(history, pd.date_range("2024-01-01", periods=300, freq="B"), "garch")
+    assert backtest["fallback_count"] == backtest["observations"]
+    assert np.isfinite(backtest["forecast_var"]).all()
 
 
 def test_evt_tail_and_filtered_garch(monkeypatch):
@@ -249,6 +361,11 @@ def test_liquidity_and_election_stress(monkeypatch):
     stress = api_app._election_stress(request,pd.Series({"AAPL":1.}),asset)
     assert liquid["lvar"] > .03 and liquid["days"] >= 1
     assert np.isfinite([stress["return"],stress["pnl"]]).all()
+    assert liquid["assumptions"]["spread"] == .002
+    assert liquid["assumptions"]["adv_lookback_days"] == 21
+    assert stress["factor_observations"] >= 60
+    assert "AAPL" in stress["factor_se"] and "AAPL" in stress["r_squared"]
+    json.dumps(stress, allow_nan=False)
 
 
 def test_dividends_follow_split_and_base_currency(monkeypatch):
