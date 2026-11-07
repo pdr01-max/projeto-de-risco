@@ -40,12 +40,12 @@ const helpContent = [
   ['#card-dd', 'Max Drawdown', 'É a maior queda percentual acumulada entre um topo histórico e o fundo seguinte, antes de uma nova máxima. Indica a perda de trajetória que um investidor teria suportado.'],
   ['#rebalance-panel', 'Limites e rebalanceamento', 'Mostra quais limites a alocação violou e a mistura sugerida de ativos e caixa para respeitá-los. O cenário é uma simulação, não uma ordem de negociação.'],
   ['#return-annual', 'Retorno anualizado', 'Transforma o crescimento observado da carteira em uma taxa composta equivalente a 252 pregões. Útil para comparar períodos; não é promessa de retorno.'],
-  ['#downside-vol', 'Volatilidade de queda', 'Mede a dispersão apenas dos retornos abaixo de zero. Destaca oscilações desfavoráveis que a volatilidade total mistura com altas.'],
+  ['#downside-vol', 'Volatilidade de queda', 'Raiz de 252 vezes a raiz da média de min(retorno diário, 0)². Usa MAR zero; o Sortino usa MAR igual à taxa livre de risco diária.'],
   ['#var-95', 'VaR diário 95%', 'Limiar de perda diária excedido em cerca de 5% dos dias sob o modelo. É menos extremo que o VaR principal selecionado.'],
   ['#worst-day', 'Pior dia histórico', 'Maior perda diária observada na janela da carteira. Serve como referência concreta; eventos futuros podem ser piores.'],
-  ['#sharpe', 'Índice de Sharpe', 'Retorno excedente à taxa livre de risco dividido pela volatilidade total. Quanto maior, melhor a compensação por unidade de oscilação, se a taxa e a janela forem comparáveis.'],
-  ['#sortino', 'Índice de Sortino', 'Retorno excedente à taxa livre de risco dividido pela volatilidade abaixo dessa taxa. Quanto maior, melhor a compensação pelo risco de queda.'],
-  ['#calmar', 'Índice de Calmar', 'Retorno anualizado dividido pelo Max Drawdown histórico. Quanto maior, melhor o retorno em relação à pior perda de trajetória.'],
+  ['#sharpe', 'Índice de Sharpe', 'Usa (média aritmética diária − rf diária) × 252 dividido pela volatilidade diária × √252. A rf diária é (1 + rf anual)^(1/252) − 1.'],
+  ['#sortino', 'Índice de Sortino', 'Usa o mesmo retorno excedente aritmético do Sharpe, dividido pela queda abaixo do MAR = rf diária, anualizada por √252.'],
+  ['#calmar', 'Índice de Calmar', 'Retorno geométrico anualizado dividido pelo maior drawdown em toda a janela histórica exibida, não apenas no último ano.'],
   ['#wealth-chart', 'Evolução do portfólio', 'Wealth Index é o valor acumulado de 1 unidade investida nos pesos escolhidos. Compare a trajetória com o benchmark convertido para a mesma moeda.'],
   ['#weights-chart', 'Pesos da carteira', 'Mostra a fração do capital alocada em cada ativo. Pesos elevados concentram exposição, mas contribuição ao risco também depende de volatilidade e correlação.'],
   ['#loss-chart', 'Distribuição de perdas', 'Histograma das perdas diárias observadas. A linha do VaR marca o limiar estimado; os dias além dela compõem a cauda relevante para o ES.'],
@@ -142,6 +142,16 @@ async function post(url, payload) {
 
 function renderRisk(data) {
   const confidenceLabel = `${(data.confidence*100).toLocaleString('pt-BR')}%`;
+  $('var-limit-label').textContent = `VaR diário ${confidenceLabel} máximo (%)`;
+  const reference = data.risk_free_reference;
+  $('rf-mode').value = reference.mode;
+  $('risk-free').value = (reference.annual * 100).toFixed(4);
+  $('rf-source').textContent = `${reference.mode === 'automatic' ? 'Automático' : 'Manual'} · ${reference.source}${reference.as_of ? ` · último dado ${reference.as_of}` : ''}. Usado em Sharpe, Sortino e Max Sharpe.`;
+  const inputs = data.metric_inputs;
+  $('metric-methodology').textContent = `Sharpe/Sortino: média diária ${(inputs.mean_daily*100).toFixed(4)}%, rf diária ${(inputs.risk_free_daily*100).toFixed(4)}%, volatilidade diária ${(inputs.volatility_daily*100).toFixed(4)}%; N=${inputs.observations}, anualização 252 pregões (volatilidade × √252). Numerador: média aritmética excedente × 252; retorno anualizado: crescimento geométrico. Sortino: MAR=rf diária; volatilidade de queda exibida: MAR=0. Calmar: maior drawdown de toda a janela exibida.`;
+  const tailWarning = data.tail_diagnostics?.warning;
+  $('model-warning').textContent = (typeof tailWarning === 'string' ? tailWarning : '') || (data.backtest.fallback_count ? `GARCH não convergiu em ${data.backtest.fallback_count} previsões do backtest; filtro EWMA usado.` : '');
+  $('model-warning').hidden = !$('model-warning').textContent;
   $('card-var').querySelector('.metric-label').textContent = `VaR ${confidenceLabel} / dia`;
   $('card-es').querySelector('.metric-label').textContent = `Expected Shortfall ${confidenceLabel}`;
   setAlert('var', data.metrics.var_99, data.limits.var_99);
@@ -161,24 +171,41 @@ function renderRisk(data) {
   ['sharpe', 'sortino', 'calmar'].forEach(id => { $(id).textContent = ratio(data.metrics[id]); });
   const kupiec = data.backtest;
   $('kupiec-status').textContent = kupiec.status;
-  $('kupiec-status').className = kupiec.status === 'Aprovado' ? 'result-approved' : kupiec.status === 'Atenção' ? 'result-warning' : 'result-rejected';
-  $('kupiec-details').textContent = `${kupiec.breaches} violações em ${kupiec.observations} observações fora da amostra · esperado: ${kupiec.expected.toFixed(1)} · Kupiec p=${kupiec.p_value.toFixed(4)} · independência p=${kupiec.p_ind.toFixed(4)} · cobertura conjunta p=${kupiec.p_cc.toFixed(4)}. Previsões usam apenas dados anteriores a cada dia.`;
+  $('kupiec-status').className = kupiec.status === 'Não rejeitado' ? 'result-approved' : kupiec.status === 'Atenção' ? 'result-warning' : 'result-rejected';
+  $('kupiec-details').textContent = `N=${kupiec.observations}; excessos observados=${kupiec.breaches}, esperados=${kupiec.expected.toFixed(1)}. LR Kupiec=${kupiec.lr_pof.toFixed(3)} (p=${kupiec.p_value.toFixed(4)}); LR independência=${kupiec.lr_ind.toFixed(3)} (p=${kupiec.p_ind.toFixed(4)}); LR conjunto=${kupiec.lr_cc.toFixed(3)} (p=${kupiec.p_cc.toFixed(4)}). Poder aproximado do Kupiec a 5%, se a frequência real de excessos dobrar: ${pct(kupiec.power_double_rate)}. ${kupiec.fallback_count ? `Fallback EWMA em ${kupiec.fallback_count} previsões. ` : ''}Previsões usam apenas dados anteriores a cada dia.`;
+  $('backtest-levels').textContent = [0.99, 0.95].map(level => { const result = data.backtest_levels[String(level)]; return `${Math.round(level*100)}%: ${result.breaches}/${result.observations} excessos; Kupiec p=${result.p_value.toFixed(4)}, independência p=${result.p_ind.toFixed(4)}, cobertura conjunta p=${result.p_cc.toFixed(4)}`; }).join(' · ');
+  const basel = data.backtest_levels['0.99'];
+  $('backtest-history').textContent = `Histórico do backtest: ${data.backtest_history.start} a ${data.backtest_history.end}. ${data.backtest_history.weights} ${basel.basel_zone ? `Zona Basileia ilustrativa (VaR 99%, últimos 250 pregões): ${basel.basel_zone}, ${basel.basel_exceptions} excessos.` : 'Zona Basileia: requer 250 previsões em 99%.'}`;
   const diag = data.tail_diagnostics;
-  const items = diag?.marginals ? Object.entries(diag.marginals).map(([i, value]) => `${data.tickers[Number(i)]}: ξ=${value.shape.toFixed(3)}, β=${value.scale.toFixed(3)}, Nu=${value.exceedances}, KS p=${value.ks_p_value.toFixed(3)}${value.warning ? ' · amostra de cauda pequena' : ''}`) : diag ? [`ξ=${diag.shape.toFixed(3)}, β=${diag.scale.toFixed(3)}, Nu=${diag.exceedances}, KS p=${diag.ks_p_value.toFixed(3)}${diag.warning ? ' · amostra de cauda pequena' : ''}`] : [];
+  const items = diag?.marginals ? Object.entries(diag.marginals).map(([i, value]) => `${data.tickers[Number(i)]}: u=${value.threshold.toFixed(3)}, ξ=${value.shape.toFixed(3)}, β=${value.scale.toFixed(3)}, Nu=${value.exceedances}, KS p=${value.ks_p_value.toFixed(3)}${value.warning ? ' · amostra de cauda pequena' : ''}`) : diag?.shape !== undefined ? [`u=${diag.threshold.toFixed(3)}, ξ=${diag.shape.toFixed(3)}, β=${diag.scale.toFixed(3)}, Nu=${diag.exceedances}, KS p=${diag.ks_p_value.toFixed(3)}${diag.warning ? ' · amostra de cauda pequena' : ''}`] : [];
   const contributions = diag?.tail_es_contribution?.map((value, i) => `${data.tickers[i]}: ${pct(value)}`).join(', ');
   $('tail-diagnostic').textContent = items.length ? `${items.join(' | ')}${diag.copula_nu ? ` · cópula ν=${diag.copula_nu.toFixed(2)}` : ''}${contributions ? ` · Contribuição ao ES conjunto: ${contributions}` : ''}` : 'O modelo selecionado não ajusta uma GPD.';
   const liq = data.liquidity;
   $('liquidity-results').textContent = liq ? `LVaR ${pct(liq.lvar)} (${money(liq.lvar * data.capital, data.base_currency)}); ES ajustado ${pct(liq.les)}. Liquidação estimada: ${liq.days} dia(s) úteis a até 10% do ADV; custo estimado ${money(liq.execution_cost, data.base_currency)}.` : 'Ative a opção de liquidez.';
+  $('liquidity-assumptions').textContent = liq ? `Premissas: spread fixo ${pct(liq.assumptions.spread)} (custo de meio spread), participação máxima ${pct(liq.assumptions.max_adv_participation)}, volume médio financeiro dos últimos ${liq.assumptions.adv_lookback_days} pregões. Spread não é bid-ask observado.` : '';
   const event = data.election_stress;
   $('election-results').textContent = event?.reason === 'none'
     ? 'Nenhum cenário hipotético selecionado — selecione um preset ou preencha choques personalizados para simular.'
     : event?.available === false ? 'Sensibilidades indisponíveis para esta janela.'
     : `Impacto estimado: ${pct(event.return)} (${money(event.pnl, data.base_currency)}). Choques de fatores e contágio conforme os campos selecionados.`;
+  $('factor-diagnostics').replaceChildren();
+  if (event?.factor_betas) {
+    const intro = document.createElement('p');
+    intro.textContent = `Regressão linear de retornos na moeda base contra IBOV, S&P 500 e USD/BRL; N=${event.factor_observations}, condição padronizada=${ratio(event.factor_condition_number)}. β ± erro-padrão; R² por ativo:`;
+    $('factor-diagnostics').append(intro);
+    data.tickers.forEach(ticker => {
+      const line = document.createElement('div');
+      const b = event.factor_betas[ticker], se = event.factor_se[ticker];
+      line.textContent = `${ticker}: IBOV ${ratio(b.ibov)} ± ${ratio(se.ibov)}, S&P 500 ${ratio(b.sp500)} ± ${ratio(se.sp500)}, USD/BRL ${ratio(b.fx)} ± ${ratio(se.fx)}, R² ${event.r_squared[ticker] === null ? '—' : pct(event.r_squared[ticker])}.`;
+      $('factor-diagnostics').append(line);
+    });
+    event.warnings.forEach(message => { const line = document.createElement('p'); line.className = 'result-warning mt-2'; line.textContent = message; $('factor-diagnostics').append(line); });
+  }
   const stressBody = $('stress-results');
   stressBody.replaceChildren();
   data.stress_tests.forEach(item => {
     const row = document.createElement('tr');
-    [item.scenario + (item.available && !item.complete ? ' · histórico parcial' : ''), `${item.start} a ${item.end}`, item.available ? pct(item.return) : 'Histórico indisponível',
+    [item.scenario + (item.available && !item.complete ? ` · parcial${!item.complete_start ? ' no início' : ''}${!item.complete_end ? ' no fim' : ''}` : ''), `${item.start} a ${item.end}`, item.available ? pct(item.return) : 'Histórico indisponível',
       item.available ? money(item.pnl, data.base_currency) : '—'].forEach(value => {
       const cell = document.createElement('td'); cell.textContent = value; row.append(cell);
     });
@@ -222,6 +249,7 @@ function renderRisk(data) {
     type: 'bar', marker: { color: chartColors.steel },
     hovertemplate: '%{x}<br>Contribuição: %{y:.2f} p.p.<extra></extra>'
   }], layout({ yaxis: { title: 'Pontos percentuais', gridcolor: chartColors.grid } }), config);
+  $('es-contribution').textContent = `${data.es_contribution_basis}: ${data.tickers.map(ticker => `${ticker} ${pct(data.es_contribution[ticker])}`).join(' · ')}. Valores em perda do capital; podem ser negativos para posições que amortecem a cauda.`;
   const wealthTraces = [{ x: data.dates, y: data.wealth_index, type: 'scatter', name: 'Carteira',
     mode: 'lines', line: { color: chartColors.amber, width: 2.5 },
     fill: 'tozeroy', fillcolor: 'rgba(233,173,69,.10)', hovertemplate: '%{x}<br>Índice: %{y:.3f}<extra></extra>'
@@ -230,11 +258,11 @@ function renderRisk(data) {
     type: 'scatter', mode: 'lines', name: data.benchmark.symbol,
     line: { color: chartColors.steel, width: 2, dash: 'dot' },
     hovertemplate: '%{x}<br>Benchmark: %{y:.3f}<extra></extra>' });
-  if (kupiec.breach_dates.length) wealthTraces.push({ x: kupiec.breach_dates, y: kupiec.breach_wealth,
+  if (kupiec.visible_breach_dates.length) wealthTraces.push({ x: kupiec.visible_breach_dates, y: kupiec.breach_wealth,
     type: 'scatter', mode: 'markers', name: 'Violação VaR', marker: { color: chartColors.red, size: 8, symbol: 'x' },
     hovertemplate: '%{x}<br>Violação VaR<extra></extra>' });
-  if (kupiec.cluster_dates?.length) wealthTraces.push({ x: kupiec.cluster_dates,
-    y: kupiec.cluster_dates.map(day => data.wealth_index[data.dates.indexOf(day)]),
+  if (kupiec.visible_cluster_dates?.length) wealthTraces.push({ x: kupiec.visible_cluster_dates,
+    y: kupiec.visible_cluster_dates.map(day => data.wealth_index[data.dates.indexOf(day)]),
     type: 'scatter', mode: 'markers', name: 'Violações consecutivas',
     marker: { color: '#ff4050', size: 12, symbol: 'diamond' } });
   Plotly.react('wealth-chart', wealthTraces, layout({ yaxis: { gridcolor: chartColors.grid, title: 'Base 1,0' } }), config);
@@ -360,7 +388,7 @@ function updateTotal() {
 }
 function toggleMethod() { $('manual-weights').hidden = $('method').value !== 'manual'; $('weight-total').hidden = $('method').value !== 'manual'; }
 const shareKeys = ['tickers', 'period', 'method', 'base-currency', 'capital', 'var-model', 'benchmark',
-  'var-limit', 'es-limit', 'vol-limit', 'dd-limit', 'confidence', 'threshold-quantile', 'risk-free',
+  'var-limit', 'es-limit', 'vol-limit', 'dd-limit', 'confidence', 'threshold-quantile', 'risk-free', 'rf-mode',
   'stress-preset', 'stress-ibov', 'stress-sp500', 'stress-fx', 'stress-vol', 'stress-contagion', 'stress-slippage'];
 function shareURL() {
   const params = new URLSearchParams();
@@ -379,7 +407,8 @@ function restoreURL() {
   } else {
     shareKeys.forEach(id => { if (params.has(id)) $(id).value = params.get(id); });
     $('liquidity').checked = params.get('liquidity') === '1';
-    if (!params.has('risk-free')) $('risk-free').value = $('base-currency').value === 'BRL' ? '11.25' : '4.50';
+    if (!params.has('rf-mode')) $('rf-mode').value = params.has('risk-free') ? 'manual' : 'automatic';
+    if (!params.has('risk-free')) $('risk-free').value = '';
     $('start-date').value = params.get('start-date') || '';
     $('end-date').value = params.get('end-date') || '';
   }
@@ -393,14 +422,25 @@ function restoreURL() {
     updateTotal();
   }
   applyStressPreset(false);
+  updateSlippage();
   updateSelectionHelp();
+  updateLimitLabel();
+}
+function updateLimitLabel() { $('var-limit-label').textContent = `VaR diário ${(Number($('confidence').value)*100).toLocaleString('pt-BR')}% máximo (%)`; }
+function updateSlippage() {
+  $('stress-slippage').disabled = $('stress-preset').value === 'none' || !$('liquidity').checked;
+  $('slippage-note').textContent = $('liquidity').checked ? 'Multiplicador usado apenas no stress político.' : 'Slippage requer LVaR ativado.';
 }
 let tickerTimer;
 $('tickers').addEventListener('input', () => { clearTimeout(tickerTimer); tickerTimer = setTimeout(() => { refreshWeights(); syncURL(); }, 250); });
 $('method').addEventListener('change', () => { toggleMethod(); updateSelectionHelp(); syncURL(); });
 $('var-model').addEventListener('change', () => { updateSelectionHelp(); syncURL(); });
+$('confidence').addEventListener('change', () => { updateLimitLabel(); syncURL(); });
 $('period').addEventListener('change', () => { $('custom-dates').hidden = $('period').value !== 'custom'; syncURL(); });
-$('base-currency').addEventListener('change', () => { $('risk-free').value = $('base-currency').value === 'BRL' ? '11.25' : '4.50'; syncURL(); });
+$('base-currency').addEventListener('change', () => { $('risk-free').value = ''; $('rf-mode').value = 'automatic'; $('rf-source').textContent = 'Automático: taxa atualizada ao calcular.'; syncURL(); });
+$('risk-free').addEventListener('input', () => { $('rf-mode').value = 'manual'; $('rf-source').textContent = 'Manual · taxa informada pelo usuário.'; syncURL(); });
+$('rf-mode').addEventListener('change', () => { $('rf-source').textContent = $('rf-mode').value === 'automatic' ? 'Automático · taxa atualizada ao calcular.' : 'Manual · taxa informada pelo usuário.'; syncURL(); });
+$('liquidity').addEventListener('change', () => { updateSlippage(); syncURL(); });
 const stressPresets = { election: [-20,-5,15,3,.8,3], fx: [-10,-3,25,2,.6,4], global: [-15,-25,10,3,.9,3] };
 const stressFields = ['stress-ibov','stress-sp500','stress-fx','stress-vol','stress-contagion','stress-slippage'];
 function applyStressPreset(changed = true) {
@@ -408,6 +448,7 @@ function applyStressPreset(changed = true) {
   const values = preset === 'none' ? [0,0,0,1,0,1] : changed ? stressPresets[preset] : null;
   if (values) stressFields.forEach((id,i) => { $(id).value = values[i]; });
   stressFields.forEach(id => { $(id).disabled = preset === 'none'; });
+  updateSlippage();
 }
 $('stress-preset').addEventListener('change', () => { applyStressPreset(); syncURL(); });
 stressFields.forEach(id => $(id).addEventListener('input', () => {
@@ -437,7 +478,9 @@ $('risk-form').addEventListener('submit', async (event) => {
     capital: Number($('capital').value),
     var_model: $('var-model').value,
     confidence: Number($('confidence').value), threshold_quantile: Number($('threshold-quantile').value),
-    risk_free_annual: Number($('risk-free').value)/100, liquidity: $('liquidity').checked,
+    risk_free_mode: $('rf-mode').value,
+    risk_free_annual: $('rf-mode').value === 'manual' && $('risk-free').value !== '' ? Number($('risk-free').value)/100 : null,
+    liquidity: $('liquidity').checked,
     stress_preset: $('stress-preset').value,
     stress_ibov: Number($('stress-ibov').value)/100, stress_sp500: Number($('stress-sp500').value)/100,
     stress_fx: Number($('stress-fx').value)/100, stress_vol_multiplier: Number($('stress-vol').value),

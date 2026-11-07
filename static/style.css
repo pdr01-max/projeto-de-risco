@@ -88,6 +88,10 @@ h1 { font-size: clamp(1.7rem, 3vw, 2.55rem); font-weight: 650; letter-spacing: -
 }
 
 .form-select option { background: #13181b; }
+.rf-mode { width: 120px; flex: 0 0 120px; }
+.liquidity-row { padding: .65rem .75rem; border: 1px solid var(--border); border-radius: 4px; background: #151a1d; }
+.liquidity-row .form-check-label { cursor: pointer; }
+.hint { line-height: 1.5; }
 .hint, .footnote, .status { color: var(--muted); font-size: .77rem; }
 .status.error { color: var(--red); }
 
