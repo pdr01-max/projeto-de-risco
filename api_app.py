@@ -5,14 +5,17 @@ from pathlib import Path
 from datetime import date, timedelta
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+from io import StringIO
 import json
+import logging
 import re
 import time
 import cvxpy as cp
 import numpy as np
 import pandas as pd
 import yfinance as yf
-from scipy.stats import norm, t as student_t, chi2
+from scipy.stats import norm, t as student_t, chi2, binom
+from scipy.special import xlogy
 from scipy.optimize import minimize_scalar
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -40,6 +43,7 @@ BENCHMARKS = {"none", "^BVSP", "^GSPC"}
 STRESS_PRESETS = {"none", "custom", "election", "fx", "global"}
 STRESS_WINDOWS = {"Covid (fev–mar/2020)": ("2020-02-19", "2020-03-24"),
                   "Crise financeira (2008)": ("2008-09-12", "2008-11-22")}
+LOGGER = logging.getLogger(__name__)
 app = FastAPI(title="Quant Risk Engine", version="2.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
@@ -59,6 +63,7 @@ class PortfolioRequest(BaseModel):
     confidence: float = Field(default=.99, ge=.99, le=.999)
     threshold_quantile: float = Field(default=.90, ge=.90, le=.975)
     risk_free_annual: float | None = Field(default=None, ge=-.99, le=1.)
+    risk_free_mode: str | None = None
     liquidity: bool = False
     stress_preset: str = "none"
     stress_ibov: float = Field(default=-.15, ge=-1, le=2)
@@ -91,8 +96,12 @@ class PortfolioRequest(BaseModel):
             raise ValueError("Cenário de stress inválido")
         if self.confidence not in {.99, .995, .999} or self.threshold_quantile not in {.90, .95, .975}:
             raise ValueError("Confiança ou limiar EVT inválido")
-        if self.risk_free_annual is None:
-            self.risk_free_annual = .1125 if self.base_currency == "BRL" else .045
+        if self.risk_free_mode is None:
+            self.risk_free_mode = "manual" if self.risk_free_annual is not None else "automatic"
+        if self.risk_free_mode not in {"automatic", "manual"}:
+            raise ValueError("Modo da taxa livre de risco inválido")
+        if self.risk_free_mode == "manual" and self.risk_free_annual is None:
+            raise ValueError("Informe a taxa livre de risco manual")
         if self.period == "custom":
             if not self.start_date or not self.end_date or self.start_date >= self.end_date or self.end_date > date.today():
                 raise ValueError("Informe datas inicial e final válidas, até hoje.")
@@ -199,6 +208,76 @@ def _cdi_cached(start: date, end: date, bucket: int) -> pd.Series:
     if not np.isfinite(cdi.to_numpy()).all() or (cdi < 0).any():
         raise HTTPException(502, "Série histórica de CDI inválida.")
     return cdi
+
+
+@lru_cache(maxsize=32)
+def _dtb3_cached(start: date, end: date, bucket: int) -> pd.Series:
+    """FRED DTB3 daily quoted discount yield, in annual percent; no API key needed."""
+    query = urlencode({"id": "DTB3", "cosd": start.isoformat(), "coed": end.isoformat()})
+    url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?{query}"
+    with urlopen(Request(url, headers={"User-Agent": "quant-risk-engine/2.0"}), timeout=8) as response:
+        frame = pd.read_csv(StringIO(response.read().decode("utf-8")))
+    if frame.shape[1] < 2:
+        raise ValueError("FRED DTB3 sem colunas esperadas")
+    dates = pd.to_datetime(frame.iloc[:, 0], errors="coerce")
+    values = pd.to_numeric(frame.iloc[:, 1], errors="coerce")
+    series = pd.Series(values.to_numpy(dtype=float), index=dates).dropna().sort_index()
+    series = series[(series.index >= pd.Timestamp(start)) & (series.index <= pd.Timestamp(end))]
+    if series.empty or not np.isfinite(series.to_numpy()).all():
+        raise ValueError("FRED DTB3 sem taxas válidas")
+    return series
+
+
+@lru_cache(maxsize=32)
+def _irx_cached(start: date, end: date, bucket: int) -> pd.Series:
+    """Yahoo ^IRX 13-week Treasury bill quoted yield, in annual percent."""
+    raw = yf.download("^IRX", start=start.isoformat(), end=(end + timedelta(days=1)).isoformat(),
+                      interval="1d", auto_adjust=True, progress=False, threads=False, timeout=15)
+    if raw.empty:
+        raise ValueError("Yahoo ^IRX sem observações")
+    close = raw["Close"]
+    if isinstance(close, pd.DataFrame):
+        close = close.iloc[:, 0]
+    result = pd.to_numeric(close, errors="coerce").dropna().sort_index()
+    if result.empty or not np.isfinite(result.to_numpy()).all():
+        raise ValueError("Yahoo ^IRX sem taxas válidas")
+    return result
+
+
+def _reference_rate(request: PortfolioRequest, returns: pd.DataFrame) -> dict:
+    """BRL: exp(252 mean(log(1+CDI_d)))-1; USD: mean quoted DTB3/^IRX annual yield."""
+    if request.risk_free_mode == "manual":
+        return {"annual": float(request.risk_free_annual), "mode": "manual",
+                "source": "Informada pelo usuário", "as_of": None}
+    start, end = returns.index[0].date(), returns.index[-1].date()
+    if request.base_currency == "BRL":
+        try:
+            series = _cdi_cached(start, end, int(time.time() // 86400))
+            aligned = series.reindex(returns.index).dropna()
+            if len(aligned) < .8 * len(returns):
+                raise ValueError("CDI não cobre a janela da carteira")
+            annual = float(np.expm1(252 * np.log1p(aligned.to_numpy()).mean()))
+            return {"annual": annual, "mode": "automatic", "source": "BCB SGS 12 · CDI composto médio da janela",
+                    "as_of": str(aligned.index[-1].date())}
+        except (HTTPException, ValueError) as exc:
+            raise HTTPException(502, "CDI automático indisponível; informe uma taxa manual.") from exc
+    source = "FRED DTB3 · média da janela (cotação em base de desconto)"
+    try:
+        series = _dtb3_cached(start, end, int(time.time() // 1800))
+        aligned = series.reindex(returns.index).dropna()
+        if len(aligned) < .7 * len(returns):
+            raise ValueError("FRED DTB3 sem cobertura suficiente da janela")
+    except (OSError, ValueError, KeyError, TimeoutError):
+        try:
+            series = _irx_cached(start, end, int(time.time() // 1800))
+            source = "Yahoo ^IRX · média da janela (alternativa)"
+        except (OSError, ValueError, KeyError, TimeoutError) as exc:
+            raise HTTPException(502, "T-bill automática indisponível em FRED e Yahoo; informe uma taxa manual.") from exc
+        aligned = series.reindex(returns.index).dropna()
+    if len(aligned) < .7 * len(returns):
+        raise HTTPException(502, "T-bill sem cobertura suficiente da janela; informe uma taxa manual.")
+    return {"annual": float(aligned.mean() / 100), "mode": "automatic", "source": source,
+            "as_of": str(aligned.index[-1].date())}
 
 
 @lru_cache(maxsize=64)
@@ -337,9 +416,14 @@ def _risk_scenarios(x: np.ndarray, assets: np.ndarray, weights: np.ndarray,
     if model == "ewma":
         return rng.normal(x.mean(), ewma_volatility(x)[-1], n), diagnostics
     if model == "garch":
-        fit = fit_garch(x)
-        mean, sigma = forecast_garch(fit)
-        return mean + sigma*np.sqrt((fit.nu-2)/fit.nu)*rng.standard_t(fit.nu, n), diagnostics
+        try:
+            fit = fit_garch(x)
+            mean, sigma = forecast_garch(fit)
+            return mean + sigma*np.sqrt((fit.nu-2)/fit.nu)*rng.standard_t(fit.nu, n), diagnostics
+        except (RuntimeError, ValueError) as exc:
+            LOGGER.warning("GARCH fallback to EWMA: %s", exc)
+            diagnostics = {"warning": "GARCH não convergiu; risco principal calculado por EWMA Normal."}
+            return rng.normal(x.mean(), ewma_volatility(x)[-1], n), diagnostics
     if model == "monte_carlo":
         draws = rng.multivariate_normal(assets.mean(axis=0),
                                        ledoit_wolf_covariance(assets), n)
@@ -372,17 +456,21 @@ def _risk_scenarios(x: np.ndarray, assets: np.ndarray, weights: np.ndarray,
         sigma = np.r_[ewma[0], ewma[:-1]]
         next_sigma = float(ewma[-1])
         if model == "filtered_garch_evt":
-            fitted = fit_garch(x)
-            h = np.empty(len(x))
-            h[0] = float(np.var(x[:30], ddof=1))*fitted.scale**2
-            shocks = (x-fitted.mean/fitted.scale)*fitted.scale
-            for i in range(1, len(x)):
-                h[i] = fitted.omega + (fitted.alpha+fitted.gamma*(shocks[i-1] < 0))*shocks[i-1]**2 + fitted.beta*h[i-1]
-            sigma = np.sqrt(h)/fitted.scale
-            next_sigma = forecast_garch(fitted)[1]
+            try:
+                fitted = fit_garch(x)
+                h = np.empty(len(x))
+                h[0] = float(np.var(x[:30], ddof=1))*fitted.scale**2
+                shocks = (x-fitted.mean/fitted.scale)*fitted.scale
+                for i in range(1, len(x)):
+                    h[i] = fitted.omega + (fitted.alpha+fitted.gamma*(shocks[i-1] < 0))*shocks[i-1]**2 + fitted.beta*h[i-1]
+                sigma = np.sqrt(h)/fitted.scale
+                next_sigma = forecast_garch(fitted)[1]
+            except (RuntimeError, ValueError) as exc:
+                LOGGER.warning("Filtered GARCH fallback to EWMA: %s", exc)
+                diagnostics = {"warning": "GARCH não convergiu; filtro EWMA aplicado à EVT."}
         standardized = -x/sigma
         fit = fit_pot(standardized, threshold)
-        diagnostics = _pot_diagnostic(fit)
+        diagnostics = {**_pot_diagnostic(fit), **(diagnostics or {})}
         diagnostics["next_volatility"] = next_sigma
         return -next_sigma*pot_quantile(fit, rng.uniform(size=n), standardized), diagnostics
     raise ValueError("unknown risk model")
@@ -406,6 +494,7 @@ def _backtest(portfolio: np.ndarray, dates: pd.Index, model: str,
     from numpy.lib.stride_tricks import sliding_window_view
     histories = sliding_window_view(portfolio, window)[:-1]
     realized = portfolio[window:]
+    fallback_count = 0
     if model == "historical":
         forecast = np.quantile(-histories, alpha, axis=1)
     elif model in {"normal", "monte_carlo"}:
@@ -418,34 +507,67 @@ def _backtest(portfolio: np.ndarray, dates: pd.Index, model: str,
         for start in range(0, len(realized), 21):
             t0 = window + start
             assets = asset_returns[t0-window:t0] if asset_returns is not None else None
-            forecast[start:start+21] = _model_var_es(
-                portfolio[t0-window:t0], model, alpha, assets, weights,
-                threshold_quantile)[0]
+            try:
+                forecast[start:start+21] = _model_var_es(
+                    portfolio[t0-window:t0], model, alpha, assets, weights,
+                    threshold_quantile)[0]
+            except (RuntimeError, ValueError) as exc:
+                if model != "filtered_garch_evt":
+                    raise
+                LOGGER.warning("Backtest GARCH EVT fallback at %s: %s", dates[t0], exc)
+                forecast[start:start+21] = _model_var_es(
+                    portfolio[t0-window:t0], "filtered_ewma_evt", alpha, assets, weights,
+                    threshold_quantile)[0]
+                fallback_count += min(21, len(realized)-start)
     else:
         forecast = np.empty(len(realized))
         for start in range(0, len(realized), 21):
             t0 = window + start
-            fit = fit_garch(portfolio[t0-window:t0])
-            mean, sigma = forecast_garch(fit)
-            variance = sigma*sigma
-            z = float(student_t.ppf(alpha, fit.nu) * np.sqrt((fit.nu-2)/fit.nu))
+            try:
+                fit = fit_garch(portfolio[t0-window:t0])
+                mean, sigma = forecast_garch(fit)
+                variance = sigma*sigma
+                z = float(student_t.ppf(alpha, fit.nu) * np.sqrt((fit.nu-2)/fit.nu))
+            except (RuntimeError, ValueError) as exc:
+                LOGGER.warning("Backtest GARCH fallback at %s: %s", dates[t0], exc)
+                fit = None
+                mean = float(portfolio[t0-window:t0].mean())
+                variance = float(ewma_volatility(portfolio[:t0])[-1]**2)
+                z = float(norm.ppf(alpha))
+                fallback_count += min(21, len(realized)-start)
             for offset in range(min(21, len(realized)-start)):
                 forecast[start+offset] = -mean + z*np.sqrt(variance)
-                shock = (realized[start+offset]-mean)*fit.scale
-                variance = (fit.omega + (fit.alpha + fit.gamma*(shock < 0))*shock**2
-                            + fit.beta*variance*fit.scale**2)/fit.scale**2
+                if fit is None:
+                    variance = .94*variance + .06*realized[start+offset]**2
+                else:
+                    shock = (realized[start+offset]-mean)*fit.scale
+                    variance = (fit.omega + (fit.alpha + fit.gamma*(shock < 0))*shock**2
+                                + fit.beta*variance*fit.scale**2)/fit.scale**2
     breaches = -realized > forecast
     result = kupiec_pof(breaches, alpha)
     independence = christoffersen_independence(breaches)
     lr_cc = result.statistic + independence.statistic
     p_cc = float(chi2.sf(lr_cc, 2))
-    status = "Aprovado" if p_cc >= .10 else "Atenção" if p_cc >= .05 else "Rejeitado"
+    status = "Não rejeitado" if p_cc >= .10 else "Atenção" if p_cc >= .05 else "Rejeitado"
     clusters = breaches & np.r_[False, breaches[:-1]]
+    n = len(breaches)
+    counts = np.arange(n+1)
+    frequencies = counts/n
+    null_rate = 1-alpha
+    lr_by_count = 2*(xlogy(counts, frequencies) + xlogy(n-counts, 1-frequencies)
+                     - xlogy(counts, null_rate) - xlogy(n-counts, 1-null_rate))
+    alternative_rate = min(2*null_rate, .999)
+    approximate_power = float(binom.pmf(counts, n, alternative_rate)[lr_by_count > chi2.ppf(.95, 1)].sum())
+    basel_exceptions = int(breaches[-250:].sum()) if alpha == .99 and n >= 250 else None
+    basel_zone = ("Verde" if basel_exceptions <= 4 else "Amarela" if basel_exceptions <= 9 else "Vermelha") if basel_exceptions is not None else None
     return {"breaches": result.breaches, "expected": float((1-alpha)*result.observations),
             "observations": result.observations, "p_value": result.p_value,
             "lr_pof": result.statistic, "lr_ind": independence.statistic,
             "p_ind": independence.p_value, "lr_cc": lr_cc, "p_cc": p_cc,
             "status": status, "dates": dates[window:].strftime("%Y-%m-%d").tolist(),
+            "confidence": alpha, "fallback_count": fallback_count,
+            "power_double_rate": approximate_power,
+            "basel_zone": basel_zone, "basel_exceptions": basel_exceptions,
             "forecast_var": forecast.tolist(),
             "breach_dates": dates[window:][breaches].strftime("%Y-%m-%d").tolist(),
             "cluster_dates": dates[window:][clusters].strftime("%Y-%m-%d").tolist(),
@@ -519,6 +641,7 @@ def _benchmark_series(request: PortfolioRequest, dates: pd.Index, bucket: int) -
 
 
 def _stress_tests(request: PortfolioRequest, weights: pd.Series, bucket: int) -> list[dict]:
+    """Point-to-point fixed-weight return for each independently downloaded crisis window."""
     results = []
     for label, (start, end) in STRESS_WINDOWS.items():
         try:
@@ -528,15 +651,19 @@ def _stress_tests(request: PortfolioRequest, weights: pd.Series, bucket: int) ->
                 raise ValueError("insufficient crisis prices")
             asset_shocks = prices.iloc[-1].to_numpy() / prices.iloc[0].to_numpy() - 1
             estimated = float(asset_shocks @ weights.loc[request.tickers].to_numpy())
-            complete = prices.index[0] <= pd.Timestamp(start) + pd.Timedelta(days=5)
+            complete_start = prices.index[0] <= pd.Timestamp(start) + pd.Timedelta(days=5)
+            complete_end = prices.index[-1] >= pd.Timestamp(end) - pd.Timedelta(days=5)
             results.append({"scenario": label, "start": str(prices.index[0].date()),
                             "end": str(prices.index[-1].date()), "return": estimated,
                             "pnl": estimated * request.capital, "available": True,
-                            "complete": bool(complete)})
+                            "complete": bool(complete_start and complete_end),
+                            "complete_start": bool(complete_start), "complete_end": bool(complete_end),
+                            "method": "ponto a ponto · pesos atuais fixos"})
         except (HTTPException, ValueError, KeyError):
             results.append({"scenario": label, "start": start, "end": end,
                             "return": None, "pnl": None, "available": False,
-                            "complete": False})
+                            "complete": False, "complete_start": False, "complete_end": False,
+                            "method": "ponto a ponto · pesos atuais fixos"})
     return results
 
 
@@ -582,6 +709,8 @@ def _liquidity_adjustment(request: PortfolioRequest, weights: pd.Series,
     horizon = max(row["days"] for row in rows)
     total_cost = sum(row["cost"] for row in rows)
     return {"positions": rows, "days": horizon, "execution_cost": total_cost,
+            "assumptions": {"spread": .002, "max_adv_participation": .1,
+                            "adv_lookback_days": 21, "adv_price": "Yahoo adjusted Close × Volume"},
             "lvar": float(var*np.sqrt(horizon) + total_cost/request.capital),
             "les": float(es*np.sqrt(horizon) + total_cost/request.capital)}
 
@@ -606,8 +735,25 @@ def _election_stress(request: PortfolioRequest, weights: pd.Series,
         raise HTTPException(422, "Histórico comum insuficiente para estimar fatores de stress.")
     x = joined[["factor_ibov", "factor_sp500", "factor_fx"]].to_numpy()
     x = np.column_stack([np.ones(len(x)), x])
-    beta = np.linalg.lstsq(x, joined[request.tickers].to_numpy(), rcond=None)[0]
+    y = joined[request.tickers].to_numpy()
+    beta, _, rank, _ = np.linalg.lstsq(x, y, rcond=None)
+    residual = y - x @ beta
+    rss = (residual**2).sum(axis=0)
+    tss = ((y-y.mean(axis=0))**2).sum(axis=0)
+    r_squared = np.divide(tss-rss, tss, out=np.full_like(tss, np.nan), where=tss > 0)
+    standardized = (x[:, 1:] - x[:, 1:].mean(axis=0)) / np.maximum(x[:, 1:].std(axis=0), 1e-12)
+    condition_number = float(np.linalg.cond(standardized))
+    if rank == x.shape[1] and len(x) > rank:
+        variance = rss / (len(x)-rank)
+        beta_se = np.sqrt(np.maximum(np.diag(np.linalg.pinv(x.T @ x))[:, None] * variance[None, :], 0.))
+    else:
+        beta_se = np.full(beta.shape, np.nan)
     shock = np.array([1., request.stress_ibov, request.stress_sp500, request.stress_fx])
+    warnings = []
+    if rank < x.shape[1] or condition_number > 30:
+        warnings.append("Fatores colineares ou quase colineares: betas e erros-padrão podem ser instáveis (condição padronizada > 30 é um sinal heurístico).")
+    if np.any(np.abs(shock[1:]) > np.max(np.abs(x[:, 1:]), axis=0)):
+        warnings.append("Choque fora da amplitude diária observada: extrapolação linear, não previsão de crise.")
     linear = shock @ beta
     vol = joined[request.tickers].std(ddof=1).to_numpy()
     correlation = validate_correlation(joined[request.tickers].corr().fillna(0).to_numpy())
@@ -625,17 +771,25 @@ def _election_stress(request: PortfolioRequest, weights: pd.Series,
     return {"return": impact, "pnl": impact*request.capital,
             "asset_impacts": dict(zip(request.tickers, stressed.tolist())),
             "factor_betas": {symbol: dict(zip(("intercept", "ibov", "sp500", "fx"), beta[:, i].tolist()))
-                             for i, symbol in enumerate(request.tickers)}}
+                             for i, symbol in enumerate(request.tickers)},
+            "factor_se": {symbol: dict(zip(("intercept", "ibov", "sp500", "fx"),
+                                              [float(v) if np.isfinite(v) else None for v in beta_se[:, i]]))
+                          for i, symbol in enumerate(request.tickers)},
+            "r_squared": {symbol: float(v) if np.isfinite(v) else None
+                          for symbol, v in zip(request.tickers, r_squared)},
+            "factor_condition_number": condition_number if np.isfinite(condition_number) else None,
+            "factor_observations": len(x), "warnings": warnings}
 
 
-def _max_sharpe(returns: pd.DataFrame) -> pd.Series:
-    """Long-only max Sharpe via homogeneous convex min variance: min x'Sigma x, mu'x>=1."""
-    mu = returns.mean().to_numpy()
-    if np.max(mu) <= 0:
-        raise HTTPException(422, "Max Sharpe requer ao menos um retorno médio positivo nesta janela.")
+def _max_sharpe(returns: pd.DataFrame, risk_free_annual: float = 0.) -> pd.Series:
+    """Maximize (mu-r_f)'w/sqrt(w'Sigma w) via min x'Sigma x, (mu-r_f)'x>=1."""
+    daily_rf = (1 + risk_free_annual) ** (1 / 252) - 1
+    excess_mu = returns.mean().to_numpy() - daily_rf
+    if np.max(excess_mu) <= 0:
+        raise HTTPException(422, "Max Sharpe requer retorno médio acima da taxa livre de risco.")
     sigma = ledoit_wolf_covariance(returns.to_numpy())
-    x = cp.Variable(len(mu), nonneg=True)
-    scaled_mean = mu / np.max(mu)
+    x = cp.Variable(len(excess_mu), nonneg=True)
+    scaled_mean = excess_mu / np.max(excess_mu)
     problem = cp.Problem(cp.Minimize(cp.quad_form(x, sigma)), [scaled_mean @ x >= 1])
     problem.solve()
     if problem.status not in {cp.OPTIMAL, cp.OPTIMAL_INACCURATE} or x.value is None:
@@ -644,14 +798,14 @@ def _max_sharpe(returns: pd.DataFrame) -> pd.Series:
     return pd.Series(weights / weights.sum(), index=returns.columns)
 
 
-def _optimize(returns: pd.DataFrame, method: str) -> pd.Series:
+def _optimize(returns: pd.DataFrame, method: str, risk_free_annual: float = 0.) -> pd.Series:
     if returns.shape[1] == 1:
         return pd.Series([1.], index=returns.columns)
     if method == "equal":
         return pd.Series(np.full(returns.shape[1], 1 / returns.shape[1]), index=returns.columns)
     try:
         if method == "max_sharpe":
-            return _max_sharpe(returns)
+            return _max_sharpe(returns, risk_free_annual)
         if method == "min_cvar":
             return MinCVaROptimizer(alpha=.99).optimize(returns)
         covariance = ledoit_wolf_covariance(returns.to_numpy())
@@ -736,8 +890,10 @@ def health() -> dict[str, str]:
 @app.post("/api/portfolio_risk")
 def portfolio_risk(request: PortfolioRequest) -> dict:
     returns = _returns(request)
+    reference = _reference_rate(request, returns)
+    risk_free = float(reference["annual"])
     weights = (pd.Series(request.weights, index=request.tickers) if request.method == "manual"
-               else _optimize(returns, request.method))
+               else _optimize(returns, request.method, risk_free))
     portfolio = returns.to_numpy() @ weights.loc[request.tickers].to_numpy()
     wealth = np.cumprod(1 + portfolio)
     drawdown = wealth / np.maximum.accumulate(np.r_[1., wealth])[1:] - 1
@@ -756,6 +912,10 @@ def portfolio_risk(request: PortfolioRequest) -> dict:
     portfolio_vol = float(np.sqrt(w @ covariance @ w))
     risk_contribution = (w * (covariance @ w) / portfolio_vol**2
                          if portfolio_vol > 0 else np.zeros_like(w))
+    asset_losses = -returns.to_numpy()
+    historical_losses = asset_losses @ w
+    tail_mask = historical_losses >= np.quantile(historical_losses, request.confidence)
+    es_contribution = w * asset_losses[tail_mask].mean(axis=0)
     correlation = returns.corr().fillna(0).to_numpy()
     np.fill_diagonal(correlation, 1.)
     purchase_analysis = []
@@ -796,14 +956,23 @@ def portfolio_risk(request: PortfolioRequest) -> dict:
                 "return_annualized": (1 + total_return) ** (365.25 / holding_days) - 1
                                      if holding_days > 0 else None,
             })
-    returns.attrs["risk_free_annual"] = float(request.risk_free_annual)
+    returns.attrs["risk_free_annual"] = risk_free
     cash_series = _cash_returns(returns, request.tickers)
-    risk_free = float(request.risk_free_annual)
     daily_rf = (1+risk_free)**(1/252)-1
-    mean_excess = float((portfolio-daily_rf).mean() * 252)
+    mean_daily = float(portfolio.mean())
+    volatility_daily = float(portfolio.std(ddof=1))
+    mean_excess = float((mean_daily-daily_rf) * 252)
     downside = float(np.sqrt(np.mean(np.minimum(portfolio, 0) ** 2) * 252))
     excess_downside = float(np.sqrt(np.mean(np.minimum(portfolio - daily_rf, 0) ** 2) * 252))
     annual_return = float(np.prod(1 + portfolio) ** (252 / len(portfolio)) - 1)
+    metric_inputs = {"mean_daily": mean_daily, "risk_free_daily": daily_rf,
+                     "volatility_daily": volatility_daily, "observations": len(portfolio),
+                     "annualization_days": 252, "excess_downside_daily": excess_downside / np.sqrt(252)}
+    if len(request.tickers) == 6 and request.period == "2y" and request.method in {"max_sharpe", "risk_parity"}:
+        LOGGER.info("Sharpe/Sortino audit %s", json.dumps({"method": request.method, **metric_inputs,
+                     "risk_free_annual": risk_free,
+                     "sharpe": mean_excess / metrics["volatility_annual"] if metrics["volatility_annual"] else None,
+                     "sortino": mean_excess / excess_downside if excess_downside else None}))
     metrics.update({
         "return_annual": annual_return,
         "downside_volatility_annual": downside,
@@ -821,12 +990,34 @@ def portfolio_risk(request: PortfolioRequest) -> dict:
                                scenarios, request.confidence)
     risk_budget["selected_method"] = request.method
     risk_budget["model"] = request.var_model
-    backtest = _backtest(portfolio, returns.index, request.var_model,
-                         request.confidence, request.threshold_quantile,
-                         returns.to_numpy(), ordered_weights)
-    breach_dates = set(backtest["breach_dates"])
-    backtest["breach_wealth"] = [float(wealth[i]) for i, day in enumerate(returns.index.strftime("%Y-%m-%d"))
-                                  if day in breach_dates]
+    backtest_returns = returns
+    longer_period = {"6mo": "5y", "1y": "5y", "2y": "5y", "5y": "10y", "10y": "max"}.get(request.period)
+    if longer_period:
+        try:
+            candidate = _returns(request.model_copy(update={"period": longer_period,
+                                                      "start_date": None, "end_date": None}))
+            if len(candidate) > len(returns):
+                backtest_returns = candidate.tail(max(750, len(returns)+1))
+        except HTTPException:
+            pass
+    backtest_portfolio = backtest_returns.to_numpy() @ ordered_weights
+    levels = sorted({request.confidence, .99, .95})
+    backtest_levels = {str(level): _backtest(backtest_portfolio, backtest_returns.index,
+                                            request.var_model, level,
+                                            min(request.threshold_quantile, .90) if level == .95 else request.threshold_quantile,
+                                            backtest_returns.to_numpy(), ordered_weights)
+                       for level in levels}
+    backtest = backtest_levels[str(request.confidence)]
+    visible_dates = returns.index.strftime("%Y-%m-%d").tolist()
+    visible_wealth = dict(zip(visible_dates, wealth.tolist()))
+    backtest["visible_breach_dates"] = [day for day in backtest["breach_dates"] if day in visible_wealth]
+    backtest["breach_wealth"] = [float(visible_wealth[day]) for day in backtest["visible_breach_dates"]]
+    backtest["visible_cluster_dates"] = [day for day in backtest["cluster_dates"] if day in visible_wealth]
+    backtest_history = {"start": str(backtest_returns.index[0].date()),
+                        "end": str(backtest_returns.index[-1].date()),
+                        "observations": len(backtest_returns),
+                        "longer_than_display": len(backtest_returns) > len(returns),
+                        "weights": "Pesos atuais fixos; seleção dos pesos não é fora da amostra."}
     benchmark = _benchmark_series(request, returns.index, int(time.time() // 1800))
     stress_tests = _stress_tests(request, weights, int(time.time() // 1800))
     liquidity = _liquidity_adjustment(request, weights, returns,
@@ -839,6 +1030,7 @@ def portfolio_risk(request: PortfolioRequest) -> dict:
             "metrics": metrics, "limits": limits, "base_currency": request.base_currency,
             "capital": request.capital, "var_model": request.var_model,
             "confidence": request.confidence, "risk_free_annual": risk_free,
+            "risk_free_reference": reference, "metric_inputs": metric_inputs,
             "cash_rate_source": returns.attrs.get("cash_rate_source", "CDI observado (BCB SGS 12)"),
             "tail_diagnostics": tail_diagnostics, "liquidity": liquidity,
             "election_stress": election_stress,
@@ -848,8 +1040,11 @@ def portfolio_risk(request: PortfolioRequest) -> dict:
             "rolling_volatility_21d": [None if pd.isna(v) else float(v) for v in rolling_vol],
             "correlation": correlation.tolist(),
             "risk_contribution": dict(zip(request.tickers, risk_contribution.tolist())),
+            "es_contribution": dict(zip(request.tickers, es_contribution.tolist())),
+            "es_contribution_basis": "ES histórico empírico nos pregões da janela exibida",
             "purchase_analysis": purchase_analysis,
             "benchmark": benchmark, "stress_tests": stress_tests, "backtest": backtest,
+            "backtest_levels": backtest_levels, "backtest_history": backtest_history,
             "risk_budget": risk_budget,
             "observations": len(returns)}
 
@@ -857,6 +1052,8 @@ def portfolio_risk(request: PortfolioRequest) -> dict:
 @app.post("/api/optimize")
 def optimize(request: PortfolioRequest) -> dict:
     returns = _returns(request)
+    reference = _reference_rate(request, returns)
     methods = ("equal", "max_sharpe", "min_cvar", "risk_parity", "hrp")
-    allocations = {name: _optimize(returns, name).to_dict() for name in methods}
-    return {"tickers": request.tickers, "allocations": allocations, "observations": len(returns)}
+    allocations = {name: _optimize(returns, name, reference["annual"]).to_dict() for name in methods}
+    return {"tickers": request.tickers, "allocations": allocations, "observations": len(returns),
+            "risk_free_reference": reference}
