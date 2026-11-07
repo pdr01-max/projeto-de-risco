@@ -43,7 +43,9 @@ def fit_garch(returns: ArrayLike, *, asymmetric: bool = False) -> GarchFit:
     model = arch_model(y, mean="Constant", vol="GARCH", p=1,
                        o=1 if asymmetric else 0, q=1,
                        dist="StudentsT", rescale=False)
-    result = model.fit(disp="off", show_warning=False, options={"maxiter": 300})
+    result = model.fit(disp="off", show_warning=True, options={"maxiter": 300})
+    if int(result.convergence_flag) != 0:
+        raise RuntimeError(f"GARCH failed to converge (optimizer code {result.convergence_flag})")
     parameters = result.params
     omega = float(parameters["omega"])
     alpha = float(parameters["alpha[1]"])

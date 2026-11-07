@@ -59,3 +59,9 @@ def test_every_method_and_risk_model_has_explanation() -> None:
 def test_confidence_headings_follow_selected_level() -> None:
     assert "`VaR ${confidenceLabel} / dia`" in JS
     assert "`Expected Shortfall ${confidenceLabel}`" in JS
+
+
+def test_risk_free_mode_keeps_legacy_links() -> None:
+    assert "params.has('risk-free') ? 'manual' : 'automatic'" in JS
+    assert "'rf-mode'" in JS
+    assert 'risk_free_annual: $(\'rf-mode\').value === \'manual\'' in JS
